@@ -29,7 +29,8 @@ const app = express();
 app.use(express.static(path.join(__dirname, 'public')));
 app.get('/health', (_req, res) => res.send('ok'));
 const server = http.createServer(app);
-const io = new Server(server, { pingInterval: 10000, pingTimeout: 8000 });
+// Patient pings: phones on slow or patchy mobile data should not be dropped every few seconds.
+const io = new Server(server, { pingInterval: 20000, pingTimeout: 25000 });
 
 const rooms = new Map();
 

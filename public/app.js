@@ -2,7 +2,10 @@
 'use strict';
 
 const $app = document.getElementById('app');
-const socket = io({ transports: ['websocket', 'polling'] });
+// Starts with HTTP polling and upgrades to WebSocket when the network allows it, so networks
+// that block or break WebSocket still work.
+const socket = io({ reconnectionDelay: 500, reconnectionDelayMax: 3000, timeout: 15000 });
+const netbar = document.getElementById('netbar');
 const fa = n => String(n).replace(/\d/g, d => '۰۱۲۳۴۵۶۷۸۹'[d]);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const COLORS = ['#8b5cf6', '#ec4899', '#f59e0b', '#22c55e', '#3b82f6', '#ef4444', '#14b8a6', '#f97316', '#a855f7', '#0ea5e9'];
@@ -39,13 +42,33 @@ function toast(msg) {
 
 // ---------- socket ----------
 socket.on('connect', () => {
+  netbar.hidden = true;
   const code = store.get('ayaa.room');
   if (code) socket.emit('resume', { playerId, code });
   else if (!state) render(true);
 });
 socket.on('gone', () => { store.del('ayaa.room'); state = null; render(true); });
 socket.on('problem', msg => toast(msg));
-socket.on('disconnect', () => toast('اتصال قطع شد… دوباره وصل می‌شیم'));
+socket.on('disconnect', () => { netbar.hidden = false; });
+socket.io.on('reconnect_attempt', () => { netbar.hidden = false; });
+
+// Asks the server for the room again (after the phone wakes up, or when the screen looks stuck).
+let lastResume = 0;
+function refresh() {
+  const code = store.get('ayaa.room');
+  if (!code) return;
+  if (!socket.connected) { socket.connect(); return; }
+  if (Date.now() - lastResume < 4000) return;
+  lastResume = Date.now();
+  socket.emit('resume', { playerId, code });
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
+window.addEventListener('online', refresh);
+window.addEventListener('pageshow', refresh);
+// Watchdog: if a phase's time ran out a few seconds ago and nothing new came, fetch the state.
+setInterval(() => {
+  if (state && state.deadline && Date.now() + clockOffset > state.deadline + 5000) refresh();
+}, 2000);
 socket.on('state', s => {
   clockOffset = s.now - Date.now();
   if (state && state.phase !== s.phase) { confettiDone = false; editingLie = false; }
