@@ -10,13 +10,6 @@ const crypto = require('crypto');
 const express = require('express');
 const { Server } = require('socket.io');
 const { normalize, compact, isCloseTo, hasBadWord, casual } = require('./lib/text');
-// Reads .env (QUESTIONS_KEY, PORT) without extra packages.
-try {
-  for (const line of require('fs').readFileSync(path.join(__dirname, '.env'), 'utf8').split(/\r?\n/)) {
-    const m = line.match(/^\s*([A-Z_]+)\s*=\s*(.*?)\s*$/);
-    if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2];
-  }
-} catch (e) { /* no .env: use real environment variables */ }
 const BANK = require('./lib/questions');
 const DEFAULT_SETTINGS = { mode: 'word', rounds: 7, writeSec: 60, chooseSec: 30, maxPlayers: 10 };
 const LIMITS = { rounds: [1, 30], writeSec: [15, 300], chooseSec: [10, 180], maxPlayers: [2, 50] };

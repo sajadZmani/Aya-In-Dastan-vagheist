@@ -1,5 +1,4 @@
 # Render.com Blueprint: one free web service running the game server.
-# QUESTIONS_KEY is not stored here; Render asks for it when the Blueprint is created.
 services:
   - type: web
     name: aya-in-dastan-vagheist
@@ -9,7 +8,5 @@ services:
     startCommand: npm start
     healthCheckPath: /health
     envVars:
-      - key: QUESTIONS_KEY
-        sync: false
       - key: NODE_VERSION
         value: "20"
