@@ -9,7 +9,7 @@ const http = require('http');
 const crypto = require('crypto');
 const express = require('express');
 const { Server } = require('socket.io');
-const { normalize, compact, isCloseTo, hasBadWord } = require('./lib/text');
+const { normalize, compact, isCloseTo, hasBadWord, casual } = require('./lib/text');
 // Reads .env (QUESTIONS_KEY, PORT) without extra packages.
 try {
   for (const line of require('fs').readFileSync(path.join(__dirname, '.env'), 'utf8').split(/\r?\n/)) {
@@ -330,6 +330,10 @@ io.on('connection', socket => {
     if (hasBadWord(text)) return ack({ ok: false, msg: 'کلمه‌ی بد ممنوعه! یه دروغ مؤدبانه بنویس 😇' });
     if (isCloseTo(text, room.round.q.answer)) {
       return ack({ ok: false, msg: room.settings.mode === 'story' ? 'این همون داستان واقعیه! یه داستان دیگه بساز 🤫' : 'این جواب درسته! یه دروغ دیگه بنویس 🤫' });
+    }
+    if (room.settings.mode === 'story') {
+      text = casual(text);
+      if (!text) return ack({ ok: false, msg: 'یه چیزی بنویس!' });
     }
     room.round.lies[player.id] = { text, auto: false };
     ack({ ok: true });
