@@ -60,6 +60,9 @@ const isHost = () => state && state.me && state.hostId === state.me.id;
 const secondsLeft = () => state && state.deadline ? Math.max(0, Math.ceil((state.deadline - (Date.now() + clockOffset)) / 1000)) : 0;
 const av = (name, i) => `<span class="av" style="background:${COLORS[i % COLORS.length]}">${esc([...name][0] || '?')}</span>`;
 const names = list => list.length === 1 ? list[0] : list.slice(0, -1).join('، ') + ' و ' + list[list.length - 1];
+const promptHtml = (fill) => state.kind === 'story'
+  ? `<div class="topic">موضوع: ${esc(state.topic)}</div>${fill ? `<div class="story-true">«${esc(fill)}»</div>` : '<div class="muted">یه داستان کوتاه و باورپذیر درباره‌ی این موضوع بنویس. بین همه‌ی داستان‌ها فقط یکی واقعیه!</div>'}`
+  : `<div class="question">${questionHtml(state.question, fill)}</div>`;
 const questionHtml = (q, fill) => esc(q).replace('___', fill ? `<span class="blank filled">${esc(fill)}</span>` : '<span class="blank">؟</span>');
 
 function revealIndex() {
@@ -74,7 +77,7 @@ function viewKey() {
   if (!state) return 'home' + showRules;
   const s = state;
   const base = [s.phase, s.roundNo, s.hostId];
-  if (s.phase === 'lobby') base.push(s.settings.rounds, JSON.stringify(s.players.map(p => [p.name, p.connected])));
+  if (s.phase === 'lobby') base.push(JSON.stringify(s.settings), JSON.stringify(s.players.map(p => [p.name, p.connected])));
   if (s.phase === 'write') base.push(s.myLie || '', editingLie);
   if (s.phase === 'choose') base.push(s.myPick || '');
   if (s.phase === 'reveal') base.push(revealIndex());
@@ -97,7 +100,7 @@ function tick() {
   const t = document.querySelector('.timer > div');
   const sec = document.querySelector('.secs');
   if (t && state && state.deadline) {
-    const total = state.phase === 'write' ? 60 : state.phase === 'choose' ? 30 : 9;
+    const total = state.phase === 'write' ? state.settings.writeSec : state.phase === 'choose' ? state.settings.chooseSec : 9;
     const left = secondsLeft();
     t.style.width = Math.min(100, left / total * 100) + '%';
     t.parentElement.classList.toggle('low', left <= 10);
@@ -129,9 +132,9 @@ function home() {
   </div>
   <button class="linkbtn" data-act="rules">${showRules ? 'بستن راهنما' : 'چطوری بازی کنیم؟'}</button>
   ${showRules ? `<div class="card"><ol class="rules">
-    <li>یه سؤال عجیب ولی <b>واقعی</b> با یه جای خالی میاد.</li>
-    <li>هر کی یه جواب الکی ولی باورپذیر می‌نویسه (۶۰ ثانیه).</li>
-    <li>همه‌ی دروغ‌ها با جواب واقعی قاطی می‌شن و باید جواب واقعی رو پیدا کنی (۳۰ ثانیه).</li>
+    <li><b>کلمه‌ای:</b> یه سؤال عجیب ولی واقعی با جای خالی میاد. <b>داستانی:</b> یه موضوع میاد و هر کی یه داستان الکی می‌سازه؛ بین همه فقط یکی واقعیه.</li>
+    <li>هر کی یه دروغ باورپذیر می‌نویسه. زمان نوشتن و حدس زدن رو میزبان تنظیم می‌کنه.</li>
+    <li>همه‌ی دروغ‌ها با جواب واقعی قاطی می‌شن و باید واقعی رو پیدا کنی. آخر هر راند همه می‌بینن هر جمله مال کی بود و چند رأی آورد.</li>
     <li>پیدا کردن جواب واقعی: <b>۱۰۰۰</b> امتیاز. هر کی گول دروغت رو بخوره: <b>۵۰۰</b> امتیاز برای تو.</li>
     <li>راند آخر امتیازها <b>دو برابره!</b></li>
     <li>کلمه‌ی بد ممنوعه 😇</li></ol></div>` : ''}`;
@@ -139,7 +142,10 @@ function home() {
 
 function lobby() {
   const s = state;
-  const enough = s.players.filter(p => p.connected).length >= 3;
+  const st = s.settings;
+  const enough = s.players.filter(p => p.connected).length >= 2;
+  const setting = (key, label, shown, step) => `<div class="setrow"><span>${label}</span>
+    ${isHost() ? `<div class="mini"><button data-set="${key}" data-step="${-step}" aria-label="کمتر">−</button><b>${shown}</b><button data-set="${key}" data-step="${step}" aria-label="بیشتر">+</button></div>` : `<b>${shown}</b>`}</div>`;
   return `
   <div class="logo" style="margin:8px 0 14px"><h1 style="font-size:26px">آیا این داستان واقعیست؟</h1></div>
   <div class="card roomcode">
@@ -149,17 +155,25 @@ function lobby() {
     <button class="btn ghost" data-act="share">📋 کپی لینک دعوت</button>
   </div>
   <div class="card">
-    <h2>بازیکن‌ها (${fa(s.players.length)} از ۱۰)</h2>
+    <h2>بازیکن‌ها (${fa(s.players.length)} از ${fa(st.maxPlayers)})</h2>
     <ul class="players">${s.players.map((p, i) => `<li class="${p.connected ? '' : 'off'}">${av(p.name, i)}<span class="nm">${esc(p.name)}</span>${p.id === s.hostId ? '👑' : ''}</li>`).join('')}</ul>
   </div>
+  <div class="card">
+    <h2>⚙️ تنظیمات بازی</h2>
+    <div class="seg" role="group" aria-label="حالت بازی">
+      <button class="${st.mode === 'word' ? 'on' : ''}" data-mode="word" ${isHost() ? '' : 'disabled'}>🔤 کلمه‌ای<small>جای خالی رو پر کن</small></button>
+      <button class="${st.mode === 'story' ? 'on' : ''}" data-mode="story" ${isHost() ? '' : 'disabled'}>📖 داستانی<small>یه داستان بساز</small></button>
+    </div>
+    ${setting('rounds', 'تعداد راندها', fa(st.rounds), 1)}
+    ${setting('writeSec', 'زمان نوشتن', fa(st.writeSec) + ' ثانیه', 15)}
+    ${setting('chooseSec', 'زمان حدس زدن', fa(st.chooseSec) + ' ثانیه', 5)}
+    ${setting('maxPlayers', 'حداکثر بازیکن', fa(st.maxPlayers) + ' نفر', 1)}
+  </div>
   <div class="card center">
-    <h2>تعداد راندها</h2>
-    ${isHost() ? `<div class="stepper"><button data-act="r-" aria-label="کمتر">−</button><span class="val">${fa(s.settings.rounds)}</span><button data-act="r+" aria-label="بیشتر">+</button></div>`
-      : `<div class="stepper"><span class="val">${fa(s.settings.rounds)}</span></div>`}
     ${isHost()
-      ? `<button class="btn green" data-act="start" ${enough ? '' : 'disabled'}>🚀 شروع بازی</button>
-         ${enough ? '' : '<p class="muted small">حداقل ۳ نفر لازمه</p>'}`
-      : '<p class="muted">منتظر میزبان 👑 برای شروع<span class="dots"></span></p>'}
+      ? `<button class="btn green" data-act="start" ${enough ? '' : 'disabled'} style="margin-top:0">🚀 شروع بازی</button>
+         ${enough ? '' : '<p class="muted small">حداقل ۲ نفر لازمه</p>'}`
+      : '<p class="muted" style="margin:0">منتظر میزبان 👑 برای شروع<span class="dots"></span></p>'}
   </div>
   <button class="linkbtn" data-act="leave">خروج از اتاق</button>`;
 }
@@ -177,14 +191,17 @@ function topbar() {
 function write() {
   const s = state;
   return `${topbar()}
-  <div class="card"><div class="question">${questionHtml(s.question)}</div></div>
+  <div class="card">${promptHtml()}</div>
   ${s.myLie && !editingLie
     ? `<div class="card center"><div class="muted">دروغت ثبت شد 😈</div><div style="font-size:24px;font-weight:900;margin-top:6px">«${esc(s.myLie)}»</div>
         <button class="btn ghost" data-act="relie">✏️ عوضش کن</button></div>
        <div class="waiting">منتظر بقیه<span class="dots"></span></div>`
     : `<div class="card">
-        <label for="lie">یه جواب الکی ولی باورپذیر بنویس</label>
-        <input id="lie" type="text" maxlength="40" placeholder="دروغت رو اینجا بنویس…" autocomplete="off" enterkeyhint="send">
+        ${s.kind === 'story'
+          ? `<label for="lie">داستان الکیت رو بنویس</label>
+             <textarea id="lie" maxlength="160" rows="3" placeholder="مثلاً: توی ژاپن یه جزیره هست که فقط خرگوش‌ها توش زندگی می‌کنن…"></textarea>`
+          : `<label for="lie">یه جواب الکی ولی باورپذیر بنویس</label>
+             <input id="lie" type="text" maxlength="40" placeholder="دروغت رو اینجا بنویس…" autocomplete="off" enterkeyhint="send">`}
         <button class="btn pink" data-act="lie">🤥 ثبت دروغ</button>
       </div>`}
   <div class="card"><ul class="players" id="donelist"></ul></div>`;
@@ -193,10 +210,10 @@ function write() {
 function choose() {
   const s = state;
   return `${topbar()}
-  <div class="card"><div class="question">${questionHtml(s.question)}</div></div>
-  <div class="waiting" style="margin-top:0">${s.myPick ? 'انتخابت ثبت شد. می‌تونی عوضش کنی 👀' : 'کدوم جواب واقعیه؟ 🤔'}</div>
+  <div class="card">${s.kind === 'story' ? `<div class="topic">موضوع: ${esc(s.topic)}</div>` : `<div class="question">${questionHtml(s.question)}</div>`}</div>
+  <div class="waiting" style="margin-top:0">${s.myPick ? 'انتخابت ثبت شد. می‌تونی عوضش کنی 👀' : s.kind === 'story' ? 'کدوم داستان واقعیه؟ 🤔' : 'کدوم جواب واقعیه؟ 🤔'}</div>
   <div class="options">
-    ${s.options.map(o => `<button class="opt ${o.mine ? 'mine' : ''} ${s.myPick === o.id ? 'picked' : ''}" data-pick="${esc(o.id)}" ${o.mine ? 'aria-disabled="true"' : ''}>${esc(o.text)}</button>`).join('')}
+    ${s.options.map(o => `<button class="opt ${s.kind === 'story' ? 'long' : ''} ${o.mine ? 'mine' : ''} ${s.myPick === o.id ? 'picked' : ''}" data-pick="${esc(o.id)}" ${o.mine ? 'aria-disabled="true"' : ''}>${esc(o.text)}</button>`).join('')}
   </div>
   <div class="card" style="margin-top:16px"><ul class="players" id="donelist"></ul></div>`;
 }
@@ -212,9 +229,9 @@ function reveal() {
     who = `این ${author} بود و <b>${esc(names(step.pickers))}</b> گولش رو ${step.pickers.length > 1 ? 'خوردن' : 'خورد'}! 😂`;
   }
   return `${topbar()}
-  <div class="card"><div class="question" style="font-size:19px">${questionHtml(s.question, step.truth ? step.text : null)}</div></div>
+  <div class="card">${s.kind === 'story' ? `<div class="topic">موضوع: ${esc(s.topic)}</div>` : `<div class="question" style="font-size:19px">${questionHtml(s.question, step.truth ? step.text : null)}</div>`}</div>
   <div class="card reveal-card" data-step="${i}">
-    <div class="answer">«${esc(step.text)}»</div>
+    <div class="answer ${s.kind === 'story' ? 'long' : ''}">«${esc(step.text)}»</div>
     <div><span class="stamp ${step.truth ? 'truth' : 'lie'}">${step.truth ? '✅ واقعیه!' : '❌ دروغه!'}</span></div>
     <div class="who">${who}</div>
     ${step.pickers.length && !step.house ? `<div><span class="plus">+${fa(step.points)}${step.truth ? ' برای هر نفر' : step.authors.length ? '' : ''}</span></div>` : ''}
@@ -234,8 +251,23 @@ function boardHtml(showGain) {
   }).join('')}</ul>`;
 }
 
+// Every option of the round: who wrote it and how many votes it got.
+function summaryHtml() {
+  const s = state;
+  if (!s.summary) return '';
+  return `<div class="card"><h2>🗳️ رأی‌های این راند</h2>
+    ${s.kind === 'word' ? `<div class="muted small" style="margin-bottom:8px">${questionHtml(s.question, s.answer)}</div>` : ''}
+    <ul class="summary">${s.summary.map(o => `<li class="${o.truth ? 'truth' : ''}">
+      <div class="st">${o.truth ? '✅ ' : '🤥 '}${esc(o.text)}</div>
+      <div class="meta"><span>${o.truth ? 'داستان واقعی' : o.authors.length ? 'نوشته‌ی ' + esc(names(o.authors)) : 'دروغ آماده‌ی بازی'}</span>
+        <span class="votes">${fa(o.votes)} رأی</span></div>
+      ${o.voters.length ? `<div class="voters">${o.voters.map(v => `<span>${esc(v)}</span>`).join('')}</div>` : ''}
+    </li>`).join('')}</ul></div>`;
+}
+
 function scores() {
   return `${topbar()}
+  ${summaryHtml()}
   <div class="card"><h2>🏆 جدول امتیاز</h2>${boardHtml(true)}</div>
   <div class="waiting">راند بعدی تا چند لحظه‌ی دیگه<span class="dots"></span></div>
   ${isHost() ? '<button class="linkbtn" data-act="skip">برو راند بعد ⏭</button>' : ''}`;
@@ -248,7 +280,8 @@ function end() {
   setTimeout(() => { if (!confettiDone) { confettiDone = true; confetti(); } }, 50);
   return `
   <div class="winner"><span class="crown">👑</span><h2>${esc(names(winners))}</h2><p>${winners.length > 1 ? 'مساوی شدن و با هم بردن!' : 'استاد دروغ‌سازی شد!'} 🎉</p></div>
-  <div class="card"><h2>نتیجه‌ی نهایی</h2>${boardHtml(false)}</div>
+  <div class="card"><h2>نتیجه‌ی نهایی</h2>${boardHtml(true)}</div>
+  ${summaryHtml()}
   ${isHost() ? '<button class="btn yellow" data-act="again">🔁 بازی دوباره</button>' : '<div class="waiting">منتظر میزبان برای بازی دوباره<span class="dots"></span></div>'}
   <button class="linkbtn" data-act="leave">خروج</button>`;
 }
@@ -262,7 +295,7 @@ function bind() {
   if (codeEl && params.get('room')) codeEl.value = params.get('room').toUpperCase().slice(0, 4);
   if (lieEl) {
     lieEl.focus({ preventScroll: true });
-    lieEl.addEventListener('keydown', e => { if (e.key === 'Enter') submitLie(); });
+    lieEl.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submitLie(); } });
   }
   if (codeEl) codeEl.addEventListener('keydown', e => { if (e.key === 'Enter') joinRoom(); });
 
@@ -275,8 +308,6 @@ function bind() {
       socket.emit('create', { playerId, name });
     } else if (act === 'join') joinRoom();
     else if (act === 'rules') { showRules = !showRules; render(true); }
-    else if (act === 'r-') socket.emit('settings', { rounds: state.settings.rounds - 1 });
-    else if (act === 'r+') socket.emit('settings', { rounds: state.settings.rounds + 1 });
     else if (act === 'start') socket.emit('start');
     else if (act === 'lie') submitLie();
     else if (act === 'relie') { editingLie = true; render(true); }
@@ -295,6 +326,12 @@ function bind() {
       render(true);
     }
   }));
+
+  $app.querySelectorAll('[data-set]').forEach(b => b.addEventListener('click', () => {
+    const k = b.dataset.set;
+    socket.emit('settings', { [k]: state.settings[k] + Number(b.dataset.step) });
+  }));
+  $app.querySelectorAll('[data-mode]').forEach(b => b.addEventListener('click', () => socket.emit('settings', { mode: b.dataset.mode })));
 
   $app.querySelectorAll('[data-pick]').forEach(b => b.addEventListener('click', () => {
     const opt = state.options.find(o => o.id === b.dataset.pick);

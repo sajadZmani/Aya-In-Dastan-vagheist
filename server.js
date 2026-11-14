@@ -17,15 +17,15 @@ try {
     if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2];
   }
 } catch (e) { /* no .env: use real environment variables */ }
-const QUESTIONS = require('./lib/questions');
+const BANK = require('./lib/questions');
+const DEFAULT_SETTINGS = { mode: 'word', rounds: 7, writeSec: 60, chooseSec: 30, maxPlayers: 10 };
+const LIMITS = { rounds: [1, 30], writeSec: [15, 300], chooseSec: [10, 180], maxPlayers: [2, 50] };
 
 const PORT = process.env.PORT || 3000;
-const WRITE_SECONDS = Number(process.env.WRITE_SECONDS) || 60;
-const CHOOSE_SECONDS = Number(process.env.CHOOSE_SECONDS) || 30;
 const REVEAL_STEP_SECONDS = Number(process.env.REVEAL_STEP_SECONDS) || 4.5;
 const SCORES_SECONDS = Number(process.env.SCORES_SECONDS) || 9;
-const MIN_PLAYERS = 3;
-const MAX_PLAYERS = 10;
+const MIN_PLAYERS = 2;
+const HARD_MAX_PLAYERS = 50;          // the host picks the room size up to this
 const EMPTY_ROOM_TTL = 5 * 60 * 1000;   // a room with nobody connected is removed after this
 const LOBBY_DROP_MS = 45 * 1000;        // a player who leaves the lobby is removed after this
 const POINTS_TRUTH = 1000;
@@ -58,7 +58,8 @@ function newCode() {
 }
 
 const cleanName = s => String(s || '').replace(/\s+/g, ' ').trim().slice(0, 16);
-const cleanText = s => String(s || '').replace(/\s+/g, ' ').trim().slice(0, 40);
+const cleanText = (s, max) => String(s || '').replace(/\s+/g, ' ').trim().slice(0, max);
+const maxLen = room => room.settings.mode === 'story' ? 160 : 40;
 const connected = room => [...room.players.values()].filter(p => p.connected);
 
 function clearTimer(room) {
@@ -95,7 +96,9 @@ function publicState(room, forId) {
     me: me ? { id: me.id, name: me.name } : null,
   };
   if (r) {
-    s.question = r.q.question;
+    s.question = r.q.prompt;
+    s.kind = r.q.kind;
+    s.topic = r.q.topic || null;
     if (room.phase === 'write') s.myLie = r.lies[forId] ? r.lies[forId].text : null;
     if (room.phase === 'choose') {
       s.options = r.options.map(o => ({ id: o.id, text: o.text, mine: o.authors.includes(forId) }));
@@ -105,6 +108,7 @@ function publicState(room, forId) {
       s.reveal = r.reveal;
       s.gains = r.gains;
       s.answer = r.q.answer;
+      s.summary = r.summary;
     }
   }
   return s;
@@ -117,11 +121,15 @@ function broadcast(room) {
 }
 
 // ---------- game flow ----------
+// Takes a question the room has not had yet; only when every one is used does the bank start over.
 function pickQuestion(room) {
-  let pool = QUESTIONS.filter(q => !room.used.has(q.id));
-  if (!pool.length) { room.used.clear(); pool = QUESTIONS.slice(); }
+  const mode = room.settings.mode;
+  const all = BANK[mode];
+  const used = room.used[mode];
+  let pool = all.filter(q => !used.has(q.id));
+  if (!pool.length) { used.clear(); pool = all.slice(); }
   const q = pool[crypto.randomInt(pool.length)];
-  room.used.add(q.id);
+  used.add(q.id);
   return q;
 }
 
@@ -134,7 +142,7 @@ function startGame(room) {
 function nextRound(room) {
   room.roundNo += 1;
   room.round = { q: pickQuestion(room), lies: {}, picks: {}, options: [], reveal: [], gains: {} };
-  setPhase(room, 'write', WRITE_SECONDS, () => endWriting(room));
+  setPhase(room, 'write', room.settings.writeSec, () => endWriting(room));
 }
 
 function endWriting(room) {
@@ -158,7 +166,7 @@ function endWriting(room) {
     if (!byKey.has(compact(l))) lies.push({ id: 'o' + lies.length + 'h', text: l, authors: [], truth: false });
   }
   r.options = shuffle([...lies, { id: 'truth', text: r.q.answer, authors: [], truth: true }]);
-  setPhase(room, 'choose', CHOOSE_SECONDS, () => endChoosing(room));
+  setPhase(room, 'choose', room.settings.chooseSec, () => endChoosing(room));
 }
 
 function endChoosing(room) {
@@ -187,6 +195,14 @@ function endChoosing(room) {
     if (p) p.score += n;
   }
   r.reveal = ordered;
+  // Everything at a glance: each option, who wrote it and who voted for it.
+  r.summary = r.options.map(o => {
+    const voters = pickersOf(o.id);
+    return {
+      text: o.text, truth: o.truth, votes: voters.length, voters: voters.map(name),
+      authors: o.authors.map(a => name(a) + (r.lies[a] && r.lies[a].auto ? ' (خودکار)' : '')),
+    };
+  }).sort((x, y) => (y.truth - x.truth) || (y.votes - x.votes));
   r.gains = gains;
   setPhase(room, 'reveal', Math.ceil(ordered.length * REVEAL_STEP_SECONDS + 1.5), () => showScores(room));
 }
@@ -244,7 +260,7 @@ io.on('connection', socket => {
     if (hasBadWord(name)) return fail('این اسم مناسب نیست. یه اسم دیگه انتخاب کن 🙂');
     if (typeof playerId !== 'string' || playerId.length > 64) return fail('شناسه نامعتبره.');
     const code = newCode();
-    const r = { code, hostId: playerId, players: new Map(), settings: { rounds: 7 }, phase: 'lobby', roundNo: 0, round: null, used: new Set(), timer: null, deadline: null };
+    const r = { code, hostId: playerId, players: new Map(), settings: { ...DEFAULT_SETTINGS }, phase: 'lobby', roundNo: 0, round: null, used: { word: new Set(), story: new Set() }, timer: null, deadline: null };
     rooms.set(code, r);
     r.players.set(playerId, { id: playerId, name, score: 0, connected: false });
     attach(r, r.players.get(playerId));
@@ -261,7 +277,7 @@ io.on('connection', socket => {
     if (!name) return fail('اسمت رو بنویس.');
     if (hasBadWord(name)) return fail('این اسم مناسب نیست. یه اسم دیگه انتخاب کن 🙂');
     if (r.phase !== 'lobby') return fail('این بازی شروع شده. صبر کن دور بعد تموم بشه.');
-    if (r.players.size >= MAX_PLAYERS) return fail('اتاق پره (حداکثر ۱۰ نفر).');
+    if (r.players.size >= r.settings.maxPlayers) return fail(`اتاق پره (حداکثر ${r.settings.maxPlayers} نفر).`);
     if ([...r.players.values()].some(p => normalize(p.name) === normalize(name))) return fail('این اسم توی اتاق هست. یه اسم دیگه بزن.');
     r.players.set(playerId, { id: playerId, name, score: 0, connected: false });
     attach(r, r.players.get(playerId));
@@ -274,16 +290,20 @@ io.on('connection', socket => {
     attach(r, p);
   });
 
-  socket.on('settings', ({ rounds } = {}) => {
+  socket.on('settings', (patch = {}) => {
     if (!isHost() || room.phase !== 'lobby') return;
-    rounds = parseInt(rounds, 10);
-    if (rounds >= 3 && rounds <= 15) room.settings.rounds = rounds;
+    if (patch.mode === 'word' || patch.mode === 'story') room.settings.mode = patch.mode;
+    for (const [k, [lo, hi]] of Object.entries(LIMITS)) {
+      const v = parseInt(patch[k], 10);
+      if (v >= lo && v <= hi) room.settings[k] = v;
+    }
+    if (room.settings.maxPlayers < room.players.size) room.settings.maxPlayers = room.players.size;
     broadcast(room);
   });
 
   socket.on('start', () => {
     if (!isHost() || !['lobby', 'end'].includes(room.phase)) return;
-    if (connected(room).length < MIN_PLAYERS) return fail('حداقل ۳ نفر لازمه.');
+    if (connected(room).length < MIN_PLAYERS) return fail('حداقل ۲ نفر لازمه.');
     // Players who left during the last game are dropped before a new one.
     for (const p of [...room.players.values()]) if (!p.connected) room.players.delete(p.id);
     startGame(room);
@@ -305,10 +325,12 @@ io.on('connection', socket => {
   socket.on('lie', (text, ack) => {
     ack = typeof ack === 'function' ? ack : () => {};
     if (!room || room.phase !== 'write') return ack({ ok: false, msg: 'وقت نوشتن تموم شده.' });
-    text = cleanText(text);
+    text = cleanText(text, maxLen(room));
     if (!text) return ack({ ok: false, msg: 'یه چیزی بنویس!' });
     if (hasBadWord(text)) return ack({ ok: false, msg: 'کلمه‌ی بد ممنوعه! یه دروغ مؤدبانه بنویس 😇' });
-    if (isCloseTo(text, room.round.q.answer)) return ack({ ok: false, msg: 'این جواب درسته! یه دروغ دیگه بنویس 🤫' });
+    if (isCloseTo(text, room.round.q.answer)) {
+      return ack({ ok: false, msg: room.settings.mode === 'story' ? 'این همون داستان واقعیه! یه داستان دیگه بساز 🤫' : 'این جواب درسته! یه دروغ دیگه بنویس 🤫' });
+    }
     room.round.lies[player.id] = { text, auto: false };
     ack({ ok: true });
     broadcast(room);
