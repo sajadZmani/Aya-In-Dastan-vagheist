@@ -9,8 +9,7 @@ const http = require('http');
 const crypto = require('crypto');
 const express = require('express');
 const { Server } = require('socket.io');
-const { normalize, compact, isCloseTo, hasBadWord, casual, addTypo } = require('./lib/text');
-const TYPO_SHARE = 0.3;   // story mode: share of the game's own texts that get a small typo
+const { normalize, compact, isCloseTo, hasBadWord, casual } = require('./lib/text');
 // Reads .env (QUESTIONS_KEY, PORT) without extra packages.
 try {
   for (const line of require('fs').readFileSync(path.join(__dirname, '.env'), 'utf8').split(/\r?\n/)) {
@@ -170,14 +169,6 @@ function endWriting(room) {
     if (!byKey.has(compact(l)) && !lies.some(x => compact(x.text) === compact(l))) lies.push({ id: 'o' + lies.length + 'h', text: l, authors: [], truth: false });
   }
   r.options = shuffle([...lies, { id: 'truth', text: r.q.answer, authors: [], truth: true }]);
-  // In story mode some of the game's own texts (the real story and ready-made lies, never a
-  // player's) get a small typo, so neat spelling doesn't point to the real one.
-  if (room.settings.mode === 'story') {
-    for (const o of r.options) {
-      const fromGame = o.truth || o.authors.every(a => r.lies[a] && r.lies[a].auto);
-      if (fromGame && Math.random() < TYPO_SHARE) o.text = addTypo(o.text);
-    }
-  }
   setPhase(room, 'choose', room.settings.chooseSec, () => endChoosing(room));
 }
 
@@ -200,7 +191,7 @@ function endChoosing(room) {
   const finders = pickersOf('truth');
   finders.forEach(pid => add(pid, POINTS_TRUTH * mult));
   const ordered = shuffle(steps);
-  ordered.push({ text: r.options.find(o => o.truth).text, truth: true, authors: [], pickers: finders.map(name), points: POINTS_TRUTH * mult });
+  ordered.push({ text: r.q.answer, truth: true, authors: [], pickers: finders.map(name), points: POINTS_TRUTH * mult });
 
   for (const [pid, n] of Object.entries(gains)) {
     const p = room.players.get(pid);
