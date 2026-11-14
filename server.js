@@ -161,9 +161,12 @@ function endWriting(room) {
   }
   const lies = [...byKey.values()];
   // With very few lies, add ready-made ones so there is something to choose from.
-  for (const l of r.q.lies) {
-    if (lies.length >= 2) break;
-    if (!byKey.has(compact(l))) lies.push({ id: 'o' + lies.length + 'h', text: l, authors: [], truth: false });
+  // The story's own twin first, then other ready-made fakes in random order. Story mode wants at
+  // least three lies so that with few players the real one is not easy to spot.
+  const want = room.settings.mode === 'story' ? 3 : 2;
+  for (const l of [r.q.lies[0], ...shuffle(r.q.lies.slice(1))]) {
+    if (lies.length >= want) break;
+    if (!byKey.has(compact(l)) && !lies.some(x => compact(x.text) === compact(l))) lies.push({ id: 'o' + lies.length + 'h', text: l, authors: [], truth: false });
   }
   r.options = shuffle([...lies, { id: 'truth', text: r.q.answer, authors: [], truth: true }]);
   setPhase(room, 'choose', room.settings.chooseSec, () => endChoosing(room));
