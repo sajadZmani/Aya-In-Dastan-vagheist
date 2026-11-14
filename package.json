@@ -1,0 +1,14 @@
+{
+  "name": "aya-in-dastan-vagheist",
+  "version": "1.0.0",
+  "description": "آیا این داستان واقعیست؟ — بازی چندنفره‌ی دروغ‌سازی تحت وب",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "express": "^4.21.2",
+    "socket.io": "^4.8.1"
+  }
+}
