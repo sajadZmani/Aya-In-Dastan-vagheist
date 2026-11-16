@@ -167,3 +167,12 @@ textarea { resize: none; line-height: 1.8; font-size: 18px; }
 #netbar { position: fixed; top: calc(10px + env(safe-area-inset-top)); left: 50%; transform: translateX(-50%); z-index: 25;
   background: var(--yellow); color: var(--ink); font-weight: 900; padding: 8px 18px; border-radius: 99px; box-shadow: 0 4px 0 rgba(0,0,0,.15); white-space: nowrap; }
 #netbar[hidden] { display: none; }
+
+.names { display: grid; gap: 8px; }
+.namerow { display: flex; align-items: center; gap: 8px; }
+.namerow .av { width: 34px; height: 34px; border-radius: 50%; display: grid; place-items: center; color: #fff; font-weight: 700; flex: none; }
+.namerow input { flex: 1; min-width: 0; font-size: 18px; padding: 10px 12px; }
+.namerow .x { width: 40px; height: 40px; border: 0; border-radius: 50%; background: #fee2e2; color: var(--red); font-size: 16px; cursor: pointer; flex: none; }
+.pass { padding: 28px 20px; }
+.passname { display: flex; align-items: center; justify-content: center; gap: 10px; font-size: 34px; font-weight: 900; margin: 10px 0; color: var(--purple); }
+.passname .av { width: 46px; height: 46px; border-radius: 50%; display: grid; place-items: center; color: #fff; font-size: 22px; }

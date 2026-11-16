@@ -29,6 +29,9 @@ let lastKey = '';
 let showRules = false;
 let confettiDone = false;
 let editingLie = false; // "عوضش کن" pressed after a lie was sent
+// One-phone game: the setup form before it starts, and who confirmed they're holding the phone.
+let setup = null;       // { names: [...], mode, rounds }
+let gate = null;        // id of the player who tapped «منم» for this turn
 
 // ---------- toast ----------
 let toastTimer;
@@ -73,6 +76,7 @@ socket.on('state', s => {
   clockOffset = s.now - Date.now();
   if (state && state.phase !== s.phase) { confettiDone = false; editingLie = false; }
   state = s;
+  setup = null;
   store.set('ayaa.room', s.code);
   render();
 });
@@ -97,10 +101,11 @@ function revealIndex() {
 
 // Redraw only when what is on screen really changes, so typing is never interrupted.
 function viewKey() {
-  if (!state) return 'home' + showRules;
+  if (!state) return setup ? 'setup|' + setup.names.length + '|' + setup.mode + '|' + setup.rounds : 'home' + showRules;
   const s = state;
   const base = [s.phase, s.roundNo, s.hostId];
   if (s.phase === 'lobby') base.push(JSON.stringify(s.settings), JSON.stringify(s.players.map(p => [p.name, p.connected])));
+  if (s.local && s.turn) base.push(s.turn.id, gate === s.turn.id);
   if (s.phase === 'write') base.push(s.myLie || '', editingLie);
   if (s.phase === 'choose') base.push(s.myPick || '');
   if (s.phase === 'reveal') base.push(revealIndex());
@@ -111,7 +116,7 @@ function render(force) {
   const key = viewKey();
   if (force || key !== lastKey) {
     lastKey = key;
-    const view = !state ? home : { lobby, write, choose, reveal, scores, end }[state.phase];
+    const view = !state ? (setup ? localSetup : home) : (state.local && state.turn && gate !== state.turn.id) ? passPhone : { lobby, write, choose, reveal, scores, end }[state.phase];
     $app.innerHTML = view();
     bind();
   }
@@ -147,6 +152,7 @@ function home() {
     <label for="name">اسمت چیه؟</label>
     <input id="name" type="text" maxlength="16" placeholder="مثلاً سارا" value="${name}" autocomplete="nickname">
     <button class="btn yellow" data-act="create">🎉 ساختن اتاق جدید</button>
+    <button class="btn green" data-act="local">📱 بازی با یک گوشی</button>
     <p class="or">یا با کد وارد شو</p>
     <div class="row">
       <input id="code" class="code" type="text" maxlength="4" placeholder="ABCD" autocomplete="off" autocapitalize="characters">
@@ -161,6 +167,46 @@ function home() {
     <li>پیدا کردن جواب واقعی: <b>۱۰۰۰</b> امتیاز. هر کی گول دروغت رو بخوره: <b>۵۰۰</b> امتیاز برای تو.</li>
     <li>راند آخر امتیازها <b>دو برابره!</b></li>
     <li>کلمه‌ی بد ممنوعه 😇</li></ol></div>` : ''}`;
+}
+
+// One-phone game: names and settings, then the game starts at once.
+function localSetup() {
+  const st = setup;
+  return `
+  <div class="logo" style="margin:8px 0 14px"><span class="emoji" style="font-size:48px">📱</span><h1 style="font-size:26px">بازی با یک گوشی</h1>
+    <p>گوشی دست‌به‌دست می‌چرخه و هر کی نوبتش شد، دروغش رو می‌نویسه</p></div>
+  <div class="card">
+    <h2>بازیکن‌ها (${fa(st.names.length)} نفر)</h2>
+    <div class="names">${st.names.map((n, i) => `<div class="namerow">${av(n || '?', i)}
+      <input type="text" maxlength="16" data-name="${i}" value="${esc(n)}" placeholder="اسم بازیکن ${fa(i + 1)}" autocomplete="off">
+      ${st.names.length > 2 ? `<button class="x" data-del="${i}" aria-label="حذف">✕</button>` : ''}</div>`).join('')}</div>
+    ${st.names.length < 20 ? '<button class="btn ghost" data-act="addname">➕ بازیکن جدید</button>' : ''}
+  </div>
+  <div class="card">
+    <h2>⚙️ تنظیمات بازی</h2>
+    <div class="seg" role="group" aria-label="حالت بازی">
+      <button class="${st.mode === 'word' ? 'on' : ''}" data-lmode="word">🔤 کلمه‌ای<small>جای خالی رو پر کن</small></button>
+      <button class="${st.mode === 'story' ? 'on' : ''}" data-lmode="story">📖 داستانی<small>یه داستان بساز</small></button>
+    </div>
+    <div class="setrow"><span>تعداد راندها</span><div class="mini"><button data-lrounds="-1" aria-label="کمتر">−</button><b>${fa(st.rounds)}</b><button data-lrounds="1" aria-label="بیشتر">+</button></div></div>
+    <button class="btn green" data-act="startlocal">🚀 شروع بازی</button>
+  </div>
+  <button class="linkbtn" data-act="home">بازگشت</button>`;
+}
+
+// Between turns: hand the phone over without showing what the last player wrote or chose.
+function passPhone() {
+  const s = state, t = s.turn;
+  const what = s.phase === 'write' ? (s.kind === 'story' ? 'داستان الکیت رو بنویسی' : 'دروغت رو بنویسی') : 'جواب واقعی رو حدس بزنی';
+  const i = s.players.findIndex(p => p.id === t.id);
+  return `${topbar()}
+  <div class="card center pass">
+    <div class="muted">گوشی رو بده به</div>
+    <div class="passname">${av(t.name, i)} ${esc(t.name)}</div>
+    <p class="muted">تا ${what}. بقیه نگاه نکنن 🙈</p>
+    <button class="btn yellow" data-act="iam">👋 من ${esc(t.name)} هستم</button>
+  </div>
+  <div class="card"><ul class="players" id="donelist"></ul></div>`;
 }
 
 function lobby() {
@@ -221,9 +267,9 @@ function write() {
        <div class="waiting">منتظر بقیه<span class="dots"></span></div>`
     : `<div class="card">
         ${s.kind === 'story'
-          ? `<label for="lie">داستان الکیت رو بنویس</label>
+          ? `<label for="lie">${s.local && s.turn ? esc(s.turn.name) + '، ' : ''}داستان الکیت رو بنویس</label>
              <textarea id="lie" maxlength="160" rows="3" placeholder="مثلاً: توی ژاپن یه جزیره هست که فقط خرگوش‌ها توش زندگی می‌کنن…"></textarea>`
-          : `<label for="lie">یه جواب الکی ولی باورپذیر بنویس</label>
+          : `<label for="lie">${s.local && s.turn ? esc(s.turn.name) + '، ' : ''}یه جواب الکی ولی باورپذیر بنویس</label>
              <input id="lie" type="text" maxlength="40" placeholder="دروغت رو اینجا بنویس…" autocomplete="off" enterkeyhint="send">`}
         <button class="btn pink" data-act="lie">🤥 ثبت دروغ</button>
       </div>`}
@@ -234,7 +280,7 @@ function choose() {
   const s = state;
   return `${topbar()}
   <div class="card">${s.kind === 'story' ? `<div class="topic">موضوع: ${esc(s.topic)}</div>` : `<div class="question">${questionHtml(s.question)}</div>`}</div>
-  <div class="waiting" style="margin-top:0">${s.myPick ? 'انتخابت ثبت شد. می‌تونی عوضش کنی 👀' : s.kind === 'story' ? 'کدوم داستان واقعیه؟ 🤔' : 'کدوم جواب واقعیه؟ 🤔'}</div>
+  <div class="waiting" style="margin-top:0">${s.local && s.turn ? esc(s.turn.name) + '، ' : ''}${s.myPick ? 'انتخابت ثبت شد. می‌تونی عوضش کنی 👀' : s.kind === 'story' ? 'کدوم داستان واقعیه؟ 🤔' : 'کدوم جواب واقعیه؟ 🤔'}</div>
   <div class="options">
     ${s.options.map(o => `<button class="opt ${s.kind === 'story' ? 'long' : ''} ${o.mine ? 'mine' : ''} ${s.myPick === o.id ? 'picked' : ''}" data-pick="${esc(o.id)}" ${o.mine ? 'aria-disabled="true"' : ''}>${esc(o.text)}</button>`).join('')}
   </div>
@@ -330,6 +376,26 @@ function bind() {
       store.set('ayaa.name', name);
       socket.emit('create', { playerId, name });
     } else if (act === 'join') joinRoom();
+    else if (act === 'local') {
+      let saved = [];
+      try { saved = JSON.parse(store.get('ayaa.localNames') || '[]'); } catch (e) {}
+      const mine = nameEl.value.trim();
+      const names = saved.length >= 2 ? saved : [mine, ''];
+      setup = { names, mode: store.get('ayaa.localMode') || 'word', rounds: 7 };
+      render(true);
+    }
+    else if (act === 'home') { readNames(); setup = null; render(true); }
+    else if (act === 'addname') { readNames(); setup.names.push(''); render(true); const l = $app.querySelectorAll('[data-name]'); l[l.length - 1].focus(); }
+    else if (act === 'startlocal') {
+      readNames();
+      const names = setup.names.map(n => n.trim()).filter(Boolean);
+      if (names.length < 2) return toast('حداقل ۲ تا اسم بنویس ✍️');
+      store.set('ayaa.localNames', JSON.stringify(names));
+      store.set('ayaa.localMode', setup.mode);
+      gate = null;
+      socket.emit('createLocal', { playerId, names, settings: { mode: setup.mode, rounds: setup.rounds } });
+    }
+    else if (act === 'iam') { gate = state.turn.id; render(true); }
     else if (act === 'rules') { showRules = !showRules; render(true); }
     else if (act === 'start') socket.emit('start');
     else if (act === 'lie') submitLie();
@@ -350,6 +416,12 @@ function bind() {
     }
   }));
 
+  $app.querySelectorAll('[data-del]').forEach(b => b.addEventListener('click', () => { readNames(); setup.names.splice(+b.dataset.del, 1); render(true); }));
+  $app.querySelectorAll('[data-lmode]').forEach(b => b.addEventListener('click', () => { readNames(); setup.mode = b.dataset.lmode; render(true); }));
+  $app.querySelectorAll('[data-lrounds]').forEach(b => b.addEventListener('click', () => {
+    readNames(); setup.rounds = Math.max(1, Math.min(30, setup.rounds + Number(b.dataset.lrounds))); render(true);
+  }));
+
   $app.querySelectorAll('[data-set]').forEach(b => b.addEventListener('click', () => {
     const k = b.dataset.set;
     socket.emit('settings', { [k]: state.settings[k] + Number(b.dataset.step) });
@@ -359,9 +431,14 @@ function bind() {
   $app.querySelectorAll('[data-pick]').forEach(b => b.addEventListener('click', () => {
     const opt = state.options.find(o => o.id === b.dataset.pick);
     if (opt && opt.mine) return toast('این دروغ خودته! 😄');
-    socket.emit('pick', b.dataset.pick, res => { if (res && !res.ok && res.msg) toast(res.msg); });
+    socket.emit('pick', state.local ? { option: b.dataset.pick, as: state.turn.id } : b.dataset.pick, res => { if (res && !res.ok && res.msg) toast(res.msg); });
     if (navigator.vibrate) navigator.vibrate(20);
   }));
+
+  function readNames() {
+    if (!setup) return;
+    $app.querySelectorAll('[data-name]').forEach(el => { setup.names[+el.dataset.name] = el.value; });
+  }
 
   function joinRoom() {
     const name = nameEl.value.trim();
@@ -375,7 +452,7 @@ function bind() {
   function submitLie() {
     const text = lieEl.value.trim();
     if (!text) return toast('یه چیزی بنویس!');
-    socket.emit('lie', text, res => {
+    socket.emit('lie', state.local ? { text, as: state.turn.id } : text, res => {
       if (res.ok) { editingLie = false; render(true); return; }
       if (!res.ok) { toast(res.msg); lieEl.select(); if (navigator.vibrate) navigator.vibrate([40, 40, 40]); }
     });

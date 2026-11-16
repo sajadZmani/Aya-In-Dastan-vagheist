@@ -70,6 +70,17 @@ function setPhase(room, phase, seconds, next) {
 }
 
 // ---------- state sent to clients ----------
+// One-phone rooms: a single device (the "owner") plays for everyone, passed from hand to hand.
+// The players are virtual and always count as connected; the owner is the host.
+// Whose turn it is to write or choose: the first player in order who hasn't yet.
+function turnOf(room) {
+  const r = room.round;
+  if (!room.local || !r) return null;
+  const done = room.phase === 'write' ? r.lies : room.phase === 'choose' ? r.picks : null;
+  if (!done) return null;
+  return [...room.players.values()].find(p => !done[p.id]) || null;
+}
+
 function publicState(room, forId) {
   const me = room.players.get(forId);
   const r = room.round;
@@ -89,6 +100,13 @@ function publicState(room, forId) {
     })),
     me: me ? { id: me.id, name: me.name } : null,
   };
+  if (room.local) {
+    s.local = true;
+    s.hostId = room.owner.id;
+    s.me = { id: room.owner.id, name: '' };
+    const t = turnOf(room);
+    s.turn = t ? { id: t.id, name: t.name } : null;
+  }
   if (r) {
     s.question = r.q.prompt;
     s.kind = r.q.kind;
@@ -109,6 +127,11 @@ function publicState(room, forId) {
 }
 
 function broadcast(room) {
+  if (room.local) {
+    const t = turnOf(room);
+    if (room.owner.connected) io.to(room.owner.socketId).emit('state', publicState(room, t ? t.id : null));
+    return;
+  }
   for (const p of room.players.values()) {
     if (p.connected && p.socketId) io.to(p.socketId).emit('state', publicState(room, p.id));
   }
@@ -136,7 +159,7 @@ function startGame(room) {
 function nextRound(room) {
   room.roundNo += 1;
   room.round = { q: pickQuestion(room), lies: {}, picks: {}, options: [], reveal: [], gains: {} };
-  setPhase(room, 'write', room.settings.writeSec, () => endWriting(room));
+  setPhase(room, 'write', room.local ? 0 : room.settings.writeSec, () => endWriting(room));
 }
 
 function endWriting(room) {
@@ -163,7 +186,7 @@ function endWriting(room) {
     if (!byKey.has(compact(l)) && !lies.some(x => compact(x.text) === compact(l))) lies.push({ id: 'o' + lies.length + 'h', text: l, authors: [], truth: false });
   }
   r.options = shuffle([...lies, { id: 'truth', text: r.q.answer, authors: [], truth: true }]);
-  setPhase(room, 'choose', room.settings.chooseSec, () => endChoosing(room));
+  setPhase(room, 'choose', room.local ? 0 : room.settings.chooseSec, () => endChoosing(room));
 }
 
 function endChoosing(room) {
@@ -218,6 +241,7 @@ function checkAllDone(room) {
 }
 
 function ensureHost(room) {
+  if (room.local) return;
   const host = room.players.get(room.hostId);
   if (host && host.connected) return;
   const next = connected(room)[0];
@@ -227,9 +251,10 @@ function ensureHost(room) {
 function scheduleRoomCleanup(room) {
   if (room.cleanup) clearTimeout(room.cleanup);
   room.cleanup = null;
-  if (connected(room).length) return;
+  const alive = () => room.local ? room.owner.connected : connected(room).length > 0;
+  if (alive()) return;
   room.cleanup = setTimeout(() => {
-    if (connected(room).length) return;
+    if (alive()) return;
     clearTimer(room);
     rooms.delete(room.code);
   }, EMPTY_ROOM_TTL);
@@ -237,9 +262,44 @@ function scheduleRoomCleanup(room) {
 
 // ---------- sockets ----------
 io.on('connection', socket => {
-  let room = null, player = null;
+  let room = null, player = null;   // in a one-phone room `player` stays null and the socket is the owner
   const fail = msg => socket.emit('problem', msg);
-  const isHost = () => room && player && room.hostId === player.id;
+  const isHost = () => room && (room.local ? room.owner.socketId === socket.id : player && room.hostId === player.id);
+  // Who an action is for: yourself, or in a one-phone room the player whose turn it is.
+  const actor = as => room && (room.local ? room.players.get(as) : player);
+  const unpack = (x, key) => (x && typeof x === 'object') ? [x[key], x.as] : [x, null];
+
+  function attachOwner(r) {
+    room = r; player = null;
+    r.owner.connected = true;
+    r.owner.socketId = socket.id;
+    scheduleRoomCleanup(r);
+    broadcast(r);
+  }
+
+  socket.on('createLocal', ({ playerId, names, settings = {} } = {}) => {
+    if (typeof playerId !== 'string' || playerId.length > 64) return fail('شناسه نامعتبره.');
+    names = (Array.isArray(names) ? names : []).map(cleanName).filter(Boolean);
+    if (names.length < MIN_PLAYERS) return fail('حداقل ۲ تا اسم لازمه.');
+    if (names.length > 20) return fail('حداکثر ۲۰ نفر.');
+    if (names.some(hasBadWord)) return fail('یکی از اسم‌ها مناسب نیست. عوضش کن 🙂');
+    if (new Set(names.map(normalize)).size !== names.length) return fail('دو تا اسم یکسانه. اسم‌ها باید فرق کنن.');
+    const code = newCode();
+    const r = { code, local: true, owner: { id: playerId, socketId: null, connected: false }, hostId: playerId,
+      players: new Map(), settings: { ...DEFAULT_SETTINGS }, phase: 'lobby', roundNo: 0, round: null,
+      used: { word: new Set(), story: new Set() }, timer: null, deadline: null };
+    if (settings.mode === 'word' || settings.mode === 'story') r.settings.mode = settings.mode;
+    const rounds = parseInt(settings.rounds, 10);
+    if (rounds >= LIMITS.rounds[0] && rounds <= LIMITS.rounds[1]) r.settings.rounds = rounds;
+    names.forEach((name, i) => {
+      const id = playerId + ':' + i;
+      r.players.set(id, { id, name, score: 0, connected: true });
+    });
+    rooms.set(code, r);
+    room = r;
+    r.owner.connected = true; r.owner.socketId = socket.id;
+    startGame(r);
+  });
 
   function attach(r, p) {
     room = r; player = p;
@@ -266,7 +326,7 @@ io.on('connection', socket => {
   socket.on('join', ({ playerId, name, code } = {}) => {
     code = String(code || '').trim().toUpperCase();
     const r = rooms.get(code);
-    if (!r) return fail('اتاقی با این کد پیدا نشد.');
+    if (!r || r.local) return fail('اتاقی با این کد پیدا نشد.');
     if (typeof playerId !== 'string' || playerId.length > 64) return fail('شناسه نامعتبره.');
     const existing = r.players.get(playerId);
     if (existing) return attach(r, existing);               // back after refresh / reconnect
@@ -282,6 +342,7 @@ io.on('connection', socket => {
 
   socket.on('resume', ({ playerId, code } = {}) => {
     const r = rooms.get(String(code || '').toUpperCase());
+    if (r && r.local) return r.owner.id === playerId ? attachOwner(r) : socket.emit('gone');
     const p = r && r.players.get(playerId);
     if (!p) return socket.emit('gone');
     attach(r, p);
@@ -308,6 +369,7 @@ io.on('connection', socket => {
 
   socket.on('again', () => {
     if (!isHost() || room.phase !== 'end') return;
+    if (room.local) return startGame(room);
     for (const p of [...room.players.values()]) { p.score = 0; if (!p.connected) room.players.delete(p.id); }
     room.round = null; room.roundNo = 0;
     setPhase(room, 'lobby', 0);
@@ -319,9 +381,13 @@ io.on('connection', socket => {
     else if (room.phase === 'scores') nextRound(room);
   });
 
-  socket.on('lie', (text, ack) => {
+  socket.on('lie', (payload, ack) => {
     ack = typeof ack === 'function' ? ack : () => {};
+    let [text, as] = unpack(payload, 'text');
     if (!room || room.phase !== 'write') return ack({ ok: false, msg: 'وقت نوشتن تموم شده.' });
+    const who = actor(as);
+    if (!who) return ack({ ok: false });
+    if (room.local && turnOf(room) !== who) return ack({ ok: false, msg: 'الان نوبت یکی دیگه‌ست.' });
     text = cleanText(text, maxLen(room));
     if (!text) return ack({ ok: false, msg: 'یه چیزی بنویس!' });
     if (hasBadWord(text)) return ack({ ok: false, msg: 'کلمه‌ی بد ممنوعه! یه دروغ مؤدبانه بنویس 😇' });
@@ -332,19 +398,23 @@ io.on('connection', socket => {
       text = casual(text);
       if (!text) return ack({ ok: false, msg: 'یه چیزی بنویس!' });
     }
-    room.round.lies[player.id] = { text, auto: false };
+    room.round.lies[who.id] = { text, auto: false };
     ack({ ok: true });
     broadcast(room);
     checkAllDone(room);
   });
 
-  socket.on('pick', (optionId, ack) => {
+  socket.on('pick', (payload, ack) => {
     ack = typeof ack === 'function' ? ack : () => {};
+    const [optionId, as] = unpack(payload, 'option');
     if (!room || room.phase !== 'choose') return ack({ ok: false });
+    const who = actor(as);
+    if (!who) return ack({ ok: false });
+    if (room.local && turnOf(room) !== who) return ack({ ok: false, msg: 'الان نوبت یکی دیگه‌ست.' });
     const o = room.round.options.find(x => x.id === optionId);
     if (!o) return ack({ ok: false });
-    if (o.authors.includes(player.id)) return ack({ ok: false, msg: 'این دروغ خودته! 😄' });
-    room.round.picks[player.id] = optionId;
+    if (o.authors.includes(who.id)) return ack({ ok: false, msg: 'این دروغ خودته! 😄' });
+    room.round.picks[who.id] = optionId;
     ack({ ok: true });
     broadcast(room);
     checkAllDone(room);
@@ -352,6 +422,11 @@ io.on('connection', socket => {
 
   socket.on('leave', () => {
     if (!room) return;
+    if (room.local) {
+      if (isHost()) { clearTimer(room); rooms.delete(room.code); }
+      room = null;
+      return;
+    }
     const r = room, p = player;
     room = null; player = null;
     if (r.phase === 'lobby' || r.phase === 'end') r.players.delete(p.id); else p.connected = false;
@@ -362,6 +437,10 @@ io.on('connection', socket => {
   });
 
   socket.on('disconnect', () => {
+    if (room && room.local) {
+      if (room.owner.socketId === socket.id) { room.owner.connected = false; scheduleRoomCleanup(room); }
+      return;
+    }
     if (!room || !player || player.socketId !== socket.id) return;
     const r = room, p = player;
     p.connected = false;
