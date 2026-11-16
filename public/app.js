@@ -1,10 +1,16 @@
-/* «آیا این داستان واقعیست؟» — client. Draws the state the server sends; the server decides everything. */
+/*
+ * «آیا این داستان واقعیست؟» — client.
+ * Online rooms: draws the state the server sends; the server decides everything.
+ * One-phone game: runs entirely on this phone (the Offline engine below, with the same rules from
+ * core.js), so it works without internet once the site has been opened once.
+ */
 'use strict';
 
 const $app = document.getElementById('app');
+// socket.io's script doesn't load without internet; then only the one-phone game is available.
 // Starts with HTTP polling and upgrades to WebSocket when the network allows it, so networks
 // that block or break WebSocket still work.
-const socket = io({ reconnectionDelay: 500, reconnectionDelayMax: 3000, timeout: 15000 });
+const socket = window.io ? io({ reconnectionDelay: 500, reconnectionDelayMax: 3000, timeout: 15000 }) : null;
 const netbar = document.getElementById('netbar');
 const fa = n => String(n).replace(/\d/g, d => '۰۱۲۳۴۵۶۷۸۹'[d]);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -32,6 +38,7 @@ let editingLie = false; // "عوضش کن" pressed after a lie was sent
 // One-phone game: the setup form before it starts, and who confirmed they're holding the phone.
 let setup = null;       // { names: [...], mode, rounds }
 let gate = null;        // id of the player who tapped «منم» for this turn
+let showMenu = false;   // the «⋯» menu during a game (leave / restart)
 
 // ---------- toast ----------
 let toastTimer;
@@ -43,23 +50,167 @@ function toast(msg) {
   toastTimer = setTimeout(() => t.classList.remove('show'), 2800);
 }
 
+// ---------- offline one-phone game ----------
+// The whole game on this phone: the players are names typed in at the start, the phone is passed
+// around, and there are no timers for writing and guessing. Saved after every step, so a refresh
+// or a closed tab carries on where it was. Questions already seen are remembered on the phone.
+const Offline = (() => {
+  let bank = null, hasBadWord = null, room = null, timer = null;
+  const SCORES_SECONDS = 9;
+
+  async function load() {
+    if (bank) return;
+    const get = url => fetch(url).then(r => { if (!r.ok) throw new Error(url); return r.json(); });
+    const [raw, blocklist] = await Promise.all([get('/data/bank.json'), get('/data/blocklist.json')]);
+    bank = AyaCore.buildBank(raw);
+    hasBadWord = AyaCore.badWordChecker(blocklist);
+  }
+
+  function loadUsed() {
+    let u = {};
+    try { u = JSON.parse(store.get('ayaa.used') || '{}'); } catch (e) {}
+    return { word: new Set(u.word || []), story: new Set(u.story || []) };
+  }
+
+  function save() {
+    if (!room) return store.del('ayaa.offline');
+    const { used, ...rest } = room;
+    store.set('ayaa.offline', JSON.stringify({ ...rest, players: [...room.players.values()] }));
+    store.set('ayaa.used', JSON.stringify({ word: [...used.word], story: [...used.story] }));
+  }
+
+  // Whose turn it is to write or choose: the first player in order who hasn't yet.
+  function turn() {
+    const r = room.round;
+    const done = room.phase === 'write' ? r.lies : room.phase === 'choose' ? r.picks : null;
+    return done ? [...room.players.values()].find(p => !done[p.id]) || null : null;
+  }
+
+  function push() {
+    save();
+    const t = turn();
+    const s = AyaCore.viewState(room, t ? t.id : null);
+    s.offline = true; s.local = true;
+    s.me = { id: 'me', name: '' };
+    s.turn = t ? { id: t.id, name: t.name } : null;
+    s.now = Date.now();
+    applyState(s);
+  }
+
+  function setPhase(phase, seconds) {
+    clearTimeout(timer);
+    room.phase = phase;
+    room.deadline = seconds ? Date.now() + seconds * 1000 : null;
+    schedule();
+    push();
+  }
+
+  // Timers only run between rounds (reveal, scores); after a refresh they pick up where they were.
+  function schedule() {
+    clearTimeout(timer);
+    if (!room.deadline) return;
+    const next = room.phase === 'reveal' ? showScores : room.phase === 'scores' ? nextRound : null;
+    if (next) timer = setTimeout(next, Math.max(0, room.deadline - Date.now()));
+  }
+
+  function nextRound() { AyaCore.newRound(room, bank); setPhase('write', 0); }
+  function showScores() {
+    if (room.roundNo >= room.settings.rounds) return setPhase('end', 0);
+    setPhase('scores', SCORES_SECONDS);
+  }
+
+  async function start(names, settings) {
+    await load();
+    room = {
+      players: new Map(names.map((name, i) => ['p' + i, { id: 'p' + i, name, score: 0 }])),
+      settings: { mode: settings.mode, rounds: settings.rounds },
+      hostId: 'me', phase: 'write', roundNo: 0, round: null, deadline: null, used: loadUsed(),
+    };
+    nextRound();
+  }
+
+  async function restore() {
+    let saved = null;
+    try { saved = JSON.parse(store.get('ayaa.offline') || 'null'); } catch (e) {}
+    if (!saved) return false;
+    await load();
+    room = { ...saved, players: new Map(saved.players.map(p => [p.id, p])), used: loadUsed() };
+    schedule();
+    push();
+    return true;
+  }
+
+  function quit() { clearTimeout(timer); room = null; save(); }
+
+  // The same actions the server takes from a socket.
+  function handle(event, payload, ack) {
+    ack = ack || (() => {});
+    if (!room) return ack({ ok: false });
+    const t = turn();
+    if (event === 'lie' && room.phase === 'write' && t) {
+      const raw = String(payload || '');
+      const problem = AyaCore.lieProblem(room, raw.trim(), hasBadWord);
+      if (problem) return ack({ ok: false, msg: problem });
+      const clean = AyaCore.cleanLie(room, raw);
+      if (!clean) return ack({ ok: false, msg: 'یه چیزی بنویس!' });
+      room.round.lies[t.id] = { text: clean, auto: false };
+      ack({ ok: true });
+      if (turn()) push(); else { AyaCore.finishWriting(room); setPhase('choose', 0); }
+    } else if (event === 'pick' && room.phase === 'choose' && t) {
+      const o = room.round.options.find(x => x.id === payload);
+      if (!o) return ack({ ok: false });
+      if (o.authors.includes(t.id)) return ack({ ok: false, msg: 'این دروغ خودته! 😄' });
+      room.round.picks[t.id] = payload;
+      ack({ ok: true });
+      if (turn()) push(); else setPhase('reveal', AyaCore.finishChoosing(room));
+    } else if (event === 'skip') {
+      if (room.phase === 'reveal') showScores(); else if (room.phase === 'scores') nextRound();
+    } else if (event === 'again' || event === 'restart') {
+      for (const p of room.players.values()) p.score = 0;
+      room.roundNo = 0;
+      nextRound();
+    }
+  }
+
+  return { start, restore, quit, handle, active: () => !!room };
+})();
+
+// Sends an action: to the offline game while one runs on this phone, otherwise to the server.
+function send(event, payload, ack) {
+  if (Offline.active()) return Offline.handle(event, payload, ack);
+  if (!socket || !socket.connected) return toast('اینترنت وصل نیست 📡');
+  if (ack) socket.emit(event, payload, ack); else socket.emit(event, payload);
+}
+
+function applyState(s) {
+  clockOffset = s.now - Date.now();
+  if (state && state.phase !== s.phase) { confettiDone = false; editingLie = false; showMenu = false; }
+  state = s;
+  setup = null;
+  if (!s.offline) store.set('ayaa.room', s.code);
+  render();
+}
+
 // ---------- socket ----------
-socket.on('connect', () => {
-  netbar.hidden = true;
-  const code = store.get('ayaa.room');
-  if (code) socket.emit('resume', { playerId, code });
-  else if (!state) render(true);
-});
-socket.on('gone', () => { store.del('ayaa.room'); state = null; render(true); });
-socket.on('problem', msg => toast(msg));
-socket.on('disconnect', () => { netbar.hidden = false; });
-socket.io.on('reconnect_attempt', () => { netbar.hidden = false; });
+if (socket) {
+  socket.on('connect', () => {
+    netbar.hidden = true;
+    const code = store.get('ayaa.room');
+    if (code && !Offline.active()) socket.emit('resume', { playerId, code });
+    else if (!state) render(true);
+  });
+  socket.on('gone', () => { store.del('ayaa.room'); if (!Offline.active()) { state = null; render(true); } });
+  socket.on('problem', msg => toast(msg));
+  socket.on('disconnect', () => { if (!Offline.active() && store.get('ayaa.room')) netbar.hidden = false; });
+  socket.io.on('reconnect_attempt', () => { if (!Offline.active() && store.get('ayaa.room')) netbar.hidden = false; });
+  socket.on('state', s => { if (!Offline.active()) applyState(s); });
+}
 
 // Asks the server for the room again (after the phone wakes up, or when the screen looks stuck).
 let lastResume = 0;
 function refresh() {
   const code = store.get('ayaa.room');
-  if (!code) return;
+  if (!code || !socket || Offline.active()) return;
   if (!socket.connected) { socket.connect(); return; }
   if (Date.now() - lastResume < 4000) return;
   lastResume = Date.now();
@@ -70,16 +221,8 @@ window.addEventListener('online', refresh);
 window.addEventListener('pageshow', refresh);
 // Watchdog: if a phase's time ran out a few seconds ago and nothing new came, fetch the state.
 setInterval(() => {
-  if (state && state.deadline && Date.now() + clockOffset > state.deadline + 5000) refresh();
+  if (state && !state.offline && state.deadline && Date.now() + clockOffset > state.deadline + 5000) refresh();
 }, 2000);
-socket.on('state', s => {
-  clockOffset = s.now - Date.now();
-  if (state && state.phase !== s.phase) { confettiDone = false; editingLie = false; }
-  state = s;
-  setup = null;
-  store.set('ayaa.room', s.code);
-  render();
-});
 
 // ---------- helpers ----------
 const me = () => state && state.me;
@@ -109,6 +252,7 @@ function viewKey() {
   if (s.phase === 'write') base.push(s.myLie || '', editingLie);
   if (s.phase === 'choose') base.push(s.myPick || '');
   if (s.phase === 'reveal') base.push(revealIndex());
+  base.push(showMenu);
   return base.join('|');
 }
 
@@ -141,7 +285,11 @@ function tick() {
   }
 }
 render(true);
+Offline.restore().catch(() => {});
 setInterval(() => { if (state && state.phase === 'reveal') render(); else tick(); }, 250);
+
+// Keeps the site's files on the phone so the one-phone game opens without internet.
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
 
 // ---------- views ----------
 function home() {
@@ -247,9 +395,23 @@ function lobby() {
   <button class="linkbtn" data-act="leave">خروج از اتاق</button>`;
 }
 
+// «⋯» during a game: start over (host or the one-phone game) or leave.
+function menuHtml() {
+  if (!showMenu) return '';
+  const canRestart = isHost();
+  return `<div class="sheet-bg" data-act="menu"></div>
+  <div class="sheet" role="dialog" aria-label="منو">
+    ${canRestart ? `<button class="btn yellow" data-act="restart">🔁 شروع دوباره${state.offline ? '' : ' (برگشت به لابی)'}</button>
+      <p class="muted small center">امتیازهای این بازی پاک می‌شه${state.offline ? ' و از راند اول شروع می‌شه' : ' و همه برمی‌گردن به لابی'}.</p>` : ''}
+    <button class="btn pink" data-act="leave">🚪 خروج از بازی</button>
+    <button class="btn ghost" data-act="menu">ادامه‌ی بازی</button>
+  </div>`;
+}
+
 function topbar() {
   const s = state;
-  return `<div class="topbar">
+  return `${menuHtml()}<div class="topbar">
+    <button class="pill menu-btn" data-act="menu" aria-label="منو">⋯</button>
     <span class="pill">راند ${fa(s.roundNo)} از ${fa(s.totalRounds)}</span>
     ${s.double ? '<span class="pill double">⭐ امتیاز دوبرابر</span>' : ''}
     ${s.deadline && (s.phase === 'write' || s.phase === 'choose') ? '<span class="secs"></span>' : ''}
@@ -355,6 +517,26 @@ function end() {
   <button class="linkbtn" data-act="leave">خروج</button>`;
 }
 
+// Leaves the game (online room or the one on this phone) and goes back to the home screen.
+function leaveGame() {
+  showMenu = false;
+  if (Offline.active()) Offline.quit();
+  else if (socket && socket.connected) socket.emit('leave');
+  store.del('ayaa.room');
+  state = null;
+  gate = null;
+  netbar.hidden = true;
+  history.replaceState(null, '', '/');
+  render(true);
+}
+
+// Online play needs the server; without internet only the one-phone game is there.
+function online() {
+  if (socket && navigator.onLine !== false) return true;
+  toast('برای بازی آنلاین اینترنت لازمه. «بازی با یک گوشی» بدون اینترنت هم کار می‌کنه 📱');
+  return false;
+}
+
 // ---------- actions ----------
 function bind() {
   const nameEl = document.getElementById('name');
@@ -374,7 +556,8 @@ function bind() {
       const name = nameEl.value.trim();
       if (!name) return toast('اول اسمت رو بنویس ✍️');
       store.set('ayaa.name', name);
-      socket.emit('create', { playerId, name });
+      if (!online()) return;
+      send('create', { playerId, name });
     } else if (act === 'join') joinRoom();
     else if (act === 'local') {
       let saved = [];
@@ -393,27 +576,24 @@ function bind() {
       store.set('ayaa.localNames', JSON.stringify(names));
       store.set('ayaa.localMode', setup.mode);
       gate = null;
-      socket.emit('createLocal', { playerId, names, settings: { mode: setup.mode, rounds: setup.rounds } });
+      store.del('ayaa.room');
+      Offline.start(names, { mode: setup.mode, rounds: setup.rounds }).catch(() => toast('بار اول باید با اینترنت باز بشه تا سؤال‌ها روی گوشی ذخیره بشن 📡'));
     }
     else if (act === 'iam') { gate = state.turn.id; render(true); }
     else if (act === 'rules') { showRules = !showRules; render(true); }
-    else if (act === 'start') socket.emit('start');
+    else if (act === 'start') send('start');
     else if (act === 'lie') submitLie();
     else if (act === 'relie') { editingLie = true; render(true); }
-    else if (act === 'skip') socket.emit('skip');
-    else if (act === 'again') socket.emit('again');
+    else if (act === 'skip') send('skip');
+    else if (act === 'again') send('again');
     else if (act === 'share') {
       const url = location.origin + '/?room=' + state.code;
       if (navigator.share) navigator.share({ title: 'آیا این داستان واقعیست؟', text: 'بیا بازی! کد اتاق: ' + state.code, url }).catch(() => {});
       else if (navigator.clipboard) navigator.clipboard.writeText(url).then(() => toast('لینک کپی شد 📋'), () => toast(url));
       else toast(url);
-    } else if (act === 'leave') {
-      socket.emit('leave');
-      store.del('ayaa.room');
-      state = null;
-      history.replaceState(null, '', '/');
-      render(true);
-    }
+    } else if (act === 'leave') leaveGame();
+    else if (act === 'menu') { showMenu = !showMenu; render(true); }
+    else if (act === 'restart') { showMenu = false; send('restart'); render(true); }
   }));
 
   $app.querySelectorAll('[data-del]').forEach(b => b.addEventListener('click', () => { readNames(); setup.names.splice(+b.dataset.del, 1); render(true); }));
@@ -424,14 +604,14 @@ function bind() {
 
   $app.querySelectorAll('[data-set]').forEach(b => b.addEventListener('click', () => {
     const k = b.dataset.set;
-    socket.emit('settings', { [k]: state.settings[k] + Number(b.dataset.step) });
+    send('settings', { [k]: state.settings[k] + Number(b.dataset.step) });
   }));
-  $app.querySelectorAll('[data-mode]').forEach(b => b.addEventListener('click', () => socket.emit('settings', { mode: b.dataset.mode })));
+  $app.querySelectorAll('[data-mode]').forEach(b => b.addEventListener('click', () => send('settings', { mode: b.dataset.mode })));
 
   $app.querySelectorAll('[data-pick]').forEach(b => b.addEventListener('click', () => {
     const opt = state.options.find(o => o.id === b.dataset.pick);
     if (opt && opt.mine) return toast('این دروغ خودته! 😄');
-    socket.emit('pick', state.local ? { option: b.dataset.pick, as: state.turn.id } : b.dataset.pick, res => { if (res && !res.ok && res.msg) toast(res.msg); });
+    send('pick', b.dataset.pick, res => { if (res && !res.ok && res.msg) toast(res.msg); });
     if (navigator.vibrate) navigator.vibrate(20);
   }));
 
@@ -446,13 +626,14 @@ function bind() {
     if (!name) return toast('اول اسمت رو بنویس ✍️');
     if (code.length !== 4) return toast('کد اتاق ۴ حرفیه');
     store.set('ayaa.name', name);
-    socket.emit('join', { playerId, name, code });
+    if (!online()) return;
+    send('join', { playerId, name, code });
   }
 
   function submitLie() {
     const text = lieEl.value.trim();
     if (!text) return toast('یه چیزی بنویس!');
-    socket.emit('lie', state.local ? { text, as: state.turn.id } : text, res => {
+    send('lie', text, res => {
       if (res.ok) { editingLie = false; render(true); return; }
       if (!res.ok) { toast(res.msg); lieEl.select(); if (navigator.vibrate) navigator.vibrate([40, 40, 40]); }
     });

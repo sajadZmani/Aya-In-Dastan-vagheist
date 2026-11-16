@@ -1,32 +1,33 @@
 'use strict';
 /*
- * «آیا این داستان واقعیست؟» — server.
- * The server owns every room's state and runs all the timers; clients only send actions
- * and draw whatever state they receive. Rooms live in memory (no database).
+ * «آیا این داستان واقعیست؟» — server for online rooms (one phone per player).
+ * The server owns every room's state and runs all the timers; clients only send actions and draw
+ * the state they receive. Rooms live in memory (no database). The rules themselves (lies, options,
+ * scoring, the reveal) are in public/core.js, which the offline one-phone game uses too.
  */
 const path = require('path');
 const http = require('http');
 const crypto = require('crypto');
 const express = require('express');
 const { Server } = require('socket.io');
-const { normalize, compact, isCloseTo, hasBadWord, casual } = require('./lib/text');
-const BANK = require('./lib/questions');
+const core = require('./public/core.js');
+
+const BANK = core.buildBank(require('./data/bank.json'));
+const hasBadWord = core.badWordChecker(require('./data/blocklist.json'));
+
+const PORT = process.env.PORT || 3000;
+const SCORES_SECONDS = Number(process.env.SCORES_SECONDS) || 9;
+const MIN_PLAYERS = 2;
+const EMPTY_ROOM_TTL = 5 * 60 * 1000;   // a room with nobody connected is removed after this
+const LOBBY_DROP_MS = 45 * 1000;        // a player who leaves the lobby is removed after this
+const LETTERS = 'ABCDEFGHJKLMNPQRSTUVWXYZ';  // no I/O, they look like 1/0
 const DEFAULT_SETTINGS = { mode: 'word', rounds: 7, writeSec: 60, chooseSec: 30, maxPlayers: 10 };
 const LIMITS = { rounds: [1, 30], writeSec: [15, 300], chooseSec: [10, 180], maxPlayers: [2, 50] };
 
-const PORT = process.env.PORT || 3000;
-const REVEAL_STEP_SECONDS = Number(process.env.REVEAL_STEP_SECONDS) || 4.5;
-const SCORES_SECONDS = Number(process.env.SCORES_SECONDS) || 9;
-const MIN_PLAYERS = 2;
-const HARD_MAX_PLAYERS = 50;          // the host picks the room size up to this
-const EMPTY_ROOM_TTL = 5 * 60 * 1000;   // a room with nobody connected is removed after this
-const LOBBY_DROP_MS = 45 * 1000;        // a player who leaves the lobby is removed after this
-const POINTS_TRUTH = 1000;
-const POINTS_FOOLED = 500;
-const LETTERS = 'ABCDEFGHJKLMNPQRSTUVWXYZ';  // no I/O, they look like 1/0
-
 const app = express();
 app.use(express.static(path.join(__dirname, 'public')));
+// The bank and the hashed bad-word list, for the offline one-phone game.
+app.use('/data', express.static(path.join(__dirname, 'data')));
 app.get('/health', (_req, res) => res.send('ok'));
 const server = http.createServer(app);
 // Patient pings: phones on slow or patchy mobile data should not be dropped every few seconds.
@@ -35,15 +36,6 @@ const io = new Server(server, { pingInterval: 20000, pingTimeout: 25000 });
 const rooms = new Map();
 
 // ---------- helpers ----------
-const shuffle = arr => {
-  const a = arr.slice();
-  for (let i = a.length - 1; i > 0; i--) {
-    const j = crypto.randomInt(i + 1);
-    [a[i], a[j]] = [a[j], a[i]];
-  }
-  return a;
-};
-
 function newCode() {
   let code;
   do code = Array.from({ length: 4 }, () => LETTERS[crypto.randomInt(LETTERS.length)]).join('');
@@ -52,8 +44,6 @@ function newCode() {
 }
 
 const cleanName = s => String(s || '').replace(/\s+/g, ' ').trim().slice(0, 16);
-const cleanText = (s, max) => String(s || '').replace(/\s+/g, ' ').trim().slice(0, max);
-const maxLen = room => room.settings.mode === 'story' ? 160 : 40;
 const connected = room => [...room.players.values()].filter(p => p.connected);
 
 function clearTimer(room) {
@@ -69,87 +59,14 @@ function setPhase(room, phase, seconds, next) {
   broadcast(room);
 }
 
-// ---------- state sent to clients ----------
-// One-phone rooms: a single device (the "owner") plays for everyone, passed from hand to hand.
-// The players are virtual and always count as connected; the owner is the host.
-// Whose turn it is to write or choose: the first player in order who hasn't yet.
-function turnOf(room) {
-  const r = room.round;
-  if (!room.local || !r) return null;
-  const done = room.phase === 'write' ? r.lies : room.phase === 'choose' ? r.picks : null;
-  if (!done) return null;
-  return [...room.players.values()].find(p => !done[p.id]) || null;
-}
-
-function publicState(room, forId) {
-  const me = room.players.get(forId);
-  const r = room.round;
-  const s = {
-    code: room.code,
-    phase: room.phase,
-    hostId: room.hostId,
-    settings: room.settings,
-    roundNo: room.roundNo,
-    totalRounds: room.settings.rounds,
-    double: room.roundNo === room.settings.rounds,
-    deadline: room.deadline,
-    now: Date.now(),
-    players: [...room.players.values()].map(p => ({
-      id: p.id, name: p.name, score: p.score, connected: p.connected,
-      done: r ? (room.phase === 'write' ? !!r.lies[p.id] : room.phase === 'choose' ? !!r.picks[p.id] : false) : false,
-    })),
-    me: me ? { id: me.id, name: me.name } : null,
-  };
-  if (room.local) {
-    s.local = true;
-    s.hostId = room.owner.id;
-    s.me = { id: room.owner.id, name: '' };
-    const t = turnOf(room);
-    s.turn = t ? { id: t.id, name: t.name } : null;
-  }
-  if (r) {
-    s.question = r.q.prompt;
-    s.kind = r.q.kind;
-    s.topic = r.q.topic || null;
-    if (room.phase === 'write') s.myLie = r.lies[forId] ? r.lies[forId].text : null;
-    if (room.phase === 'choose') {
-      s.options = r.options.map(o => ({ id: o.id, text: o.text, mine: o.authors.includes(forId) }));
-      s.myPick = r.picks[forId] || null;
-    }
-    if (room.phase === 'reveal' || room.phase === 'scores' || room.phase === 'end') {
-      s.reveal = r.reveal;
-      s.gains = r.gains;
-      s.answer = r.q.answer;
-      s.summary = r.summary;
-    }
-  }
-  return s;
-}
-
 function broadcast(room) {
-  if (room.local) {
-    const t = turnOf(room);
-    if (room.owner.connected) io.to(room.owner.socketId).emit('state', publicState(room, t ? t.id : null));
-    return;
-  }
   for (const p of room.players.values()) {
-    if (p.connected && p.socketId) io.to(p.socketId).emit('state', publicState(room, p.id));
+    if (!p.connected || !p.socketId) continue;
+    io.to(p.socketId).emit('state', { ...core.viewState(room, p.id), code: room.code, now: Date.now() });
   }
 }
 
 // ---------- game flow ----------
-// Takes a question the room has not had yet; only when every one is used does the bank start over.
-function pickQuestion(room) {
-  const mode = room.settings.mode;
-  const all = BANK[mode];
-  const used = room.used[mode];
-  let pool = all.filter(q => !used.has(q.id));
-  if (!pool.length) { used.clear(); pool = all.slice(); }
-  const q = pool[crypto.randomInt(pool.length)];
-  used.add(q.id);
-  return q;
-}
-
 function startGame(room) {
   for (const p of room.players.values()) p.score = 0;
   room.roundNo = 0;
@@ -157,79 +74,30 @@ function startGame(room) {
 }
 
 function nextRound(room) {
-  room.roundNo += 1;
-  room.round = { q: pickQuestion(room), lies: {}, picks: {}, options: [], reveal: [], gains: {} };
-  setPhase(room, 'write', room.local ? 0 : room.settings.writeSec, () => endWriting(room));
+  core.newRound(room, BANK);
+  setPhase(room, 'write', room.settings.writeSec, () => endWriting(room));
 }
 
 function endWriting(room) {
-  const r = room.round;
-  // Anyone who wrote nothing gets one of the ready-made lies.
-  const spare = shuffle(r.q.lies.filter(l => !Object.values(r.lies).some(x => compact(x.text) === compact(l))));
-  for (const p of room.players.values()) {
-    if (!r.lies[p.id] && spare.length) r.lies[p.id] = { text: spare.pop(), auto: true };
-  }
-  // Same lies from different players become one option with several authors.
-  const byKey = new Map();
-  for (const [pid, lie] of Object.entries(r.lies)) {
-    const key = compact(lie.text);
-    if (!byKey.has(key)) byKey.set(key, { id: 'o' + byKey.size, text: lie.text, authors: [], truth: false });
-    byKey.get(key).authors.push(pid);
-  }
-  const lies = [...byKey.values()];
-  // With very few lies, add ready-made ones so there is something to choose from.
-  // The story's own twin first, then other ready-made fakes in random order. Story mode wants at
-  // least three lies so that with few players the real one is not easy to spot.
-  const want = room.settings.mode === 'story' ? 3 : 2;
-  for (const l of [r.q.lies[0], ...shuffle(r.q.lies.slice(1))]) {
-    if (lies.length >= want) break;
-    if (!byKey.has(compact(l)) && !lies.some(x => compact(x.text) === compact(l))) lies.push({ id: 'o' + lies.length + 'h', text: l, authors: [], truth: false });
-  }
-  r.options = shuffle([...lies, { id: 'truth', text: r.q.answer, authors: [], truth: true }]);
-  setPhase(room, 'choose', room.local ? 0 : room.settings.chooseSec, () => endChoosing(room));
+  core.finishWriting(room);
+  setPhase(room, 'choose', room.settings.chooseSec, () => endChoosing(room));
 }
 
 function endChoosing(room) {
-  const r = room.round;
-  const mult = room.roundNo === room.settings.rounds ? 2 : 1;
-  const gains = {};
-  const add = (pid, n) => { gains[pid] = (gains[pid] || 0) + n; };
-  const pickersOf = id => Object.keys(r.picks).filter(pid => r.picks[pid] === id);
-  const name = pid => (room.players.get(pid) || { name: '؟' }).name;
-
-  const steps = [];
-  for (const o of r.options) {
-    if (o.truth) continue;
-    const pickers = pickersOf(o.id);
-    for (const a of o.authors) for (let i = 0; i < pickers.length; i++) add(a, POINTS_FOOLED * mult);
-    // Lies nobody fell for are skipped, unless nobody fell for anything.
-    if (pickers.length) steps.push({ text: o.text, truth: false, authors: o.authors.map(name), house: !o.authors.length, pickers: pickers.map(name), points: pickers.length * POINTS_FOOLED * mult });
-  }
-  const finders = pickersOf('truth');
-  finders.forEach(pid => add(pid, POINTS_TRUTH * mult));
-  const ordered = shuffle(steps);
-  ordered.push({ text: r.q.answer, truth: true, authors: [], pickers: finders.map(name), points: POINTS_TRUTH * mult });
-
-  for (const [pid, n] of Object.entries(gains)) {
-    const p = room.players.get(pid);
-    if (p) p.score += n;
-  }
-  r.reveal = ordered;
-  // Everything at a glance: each option, who wrote it and who voted for it.
-  r.summary = r.options.map(o => {
-    const voters = pickersOf(o.id);
-    return {
-      text: o.text, truth: o.truth, votes: voters.length, voters: voters.map(name),
-      authors: o.authors.map(a => name(a) + (r.lies[a] && r.lies[a].auto ? ' (خودکار)' : '')),
-    };
-  }).sort((x, y) => (y.truth - x.truth) || (y.votes - x.votes));
-  r.gains = gains;
-  setPhase(room, 'reveal', Math.ceil(ordered.length * REVEAL_STEP_SECONDS + 1.5), () => showScores(room));
+  const seconds = core.finishChoosing(room);
+  setPhase(room, 'reveal', seconds, () => showScores(room));
 }
 
 function showScores(room) {
   if (room.roundNo >= room.settings.rounds) return setPhase(room, 'end', 0);
   setPhase(room, 'scores', SCORES_SECONDS, () => nextRound(room));
+}
+
+// Back to the lobby with the same players, scores cleared (used by «بازی دوباره» and «شروع دوباره»).
+function backToLobby(room) {
+  for (const p of [...room.players.values()]) { p.score = 0; if (!p.connected) room.players.delete(p.id); }
+  room.round = null; room.roundNo = 0;
+  setPhase(room, 'lobby', 0);
 }
 
 // Move on early when every connected player is done.
@@ -241,7 +109,6 @@ function checkAllDone(room) {
 }
 
 function ensureHost(room) {
-  if (room.local) return;
   const host = room.players.get(room.hostId);
   if (host && host.connected) return;
   const next = connected(room)[0];
@@ -251,10 +118,9 @@ function ensureHost(room) {
 function scheduleRoomCleanup(room) {
   if (room.cleanup) clearTimeout(room.cleanup);
   room.cleanup = null;
-  const alive = () => room.local ? room.owner.connected : connected(room).length > 0;
-  if (alive()) return;
+  if (connected(room).length) return;
   room.cleanup = setTimeout(() => {
-    if (alive()) return;
+    if (connected(room).length) return;
     clearTimer(room);
     rooms.delete(room.code);
   }, EMPTY_ROOM_TTL);
@@ -262,44 +128,10 @@ function scheduleRoomCleanup(room) {
 
 // ---------- sockets ----------
 io.on('connection', socket => {
-  let room = null, player = null;   // in a one-phone room `player` stays null and the socket is the owner
+  let room = null, player = null;
   const fail = msg => socket.emit('problem', msg);
-  const isHost = () => room && (room.local ? room.owner.socketId === socket.id : player && room.hostId === player.id);
-  // Who an action is for: yourself, or in a one-phone room the player whose turn it is.
-  const actor = as => room && (room.local ? room.players.get(as) : player);
-  const unpack = (x, key) => (x && typeof x === 'object') ? [x[key], x.as] : [x, null];
-
-  function attachOwner(r) {
-    room = r; player = null;
-    r.owner.connected = true;
-    r.owner.socketId = socket.id;
-    scheduleRoomCleanup(r);
-    broadcast(r);
-  }
-
-  socket.on('createLocal', ({ playerId, names, settings = {} } = {}) => {
-    if (typeof playerId !== 'string' || playerId.length > 64) return fail('شناسه نامعتبره.');
-    names = (Array.isArray(names) ? names : []).map(cleanName).filter(Boolean);
-    if (names.length < MIN_PLAYERS) return fail('حداقل ۲ تا اسم لازمه.');
-    if (names.length > 20) return fail('حداکثر ۲۰ نفر.');
-    if (names.some(hasBadWord)) return fail('یکی از اسم‌ها مناسب نیست. عوضش کن 🙂');
-    if (new Set(names.map(normalize)).size !== names.length) return fail('دو تا اسم یکسانه. اسم‌ها باید فرق کنن.');
-    const code = newCode();
-    const r = { code, local: true, owner: { id: playerId, socketId: null, connected: false }, hostId: playerId,
-      players: new Map(), settings: { ...DEFAULT_SETTINGS }, phase: 'lobby', roundNo: 0, round: null,
-      used: { word: new Set(), story: new Set() }, timer: null, deadline: null };
-    if (settings.mode === 'word' || settings.mode === 'story') r.settings.mode = settings.mode;
-    const rounds = parseInt(settings.rounds, 10);
-    if (rounds >= LIMITS.rounds[0] && rounds <= LIMITS.rounds[1]) r.settings.rounds = rounds;
-    names.forEach((name, i) => {
-      const id = playerId + ':' + i;
-      r.players.set(id, { id, name, score: 0, connected: true });
-    });
-    rooms.set(code, r);
-    room = r;
-    r.owner.connected = true; r.owner.socketId = socket.id;
-    startGame(r);
-  });
+  const isHost = () => room && player && room.hostId === player.id;
+  const validId = id => typeof id === 'string' && id.length > 0 && id.length <= 64;
 
   function attach(r, p) {
     room = r; player = p;
@@ -311,38 +143,43 @@ io.on('connection', socket => {
     broadcast(r);
   }
 
+  function nameProblem(r, name) {
+    if (!name) return 'اسمت رو بنویس.';
+    if (hasBadWord(name)) return 'این اسم مناسب نیست. یه اسم دیگه انتخاب کن 🙂';
+    if (r && [...r.players.values()].some(p => core.normalize(p.name) === core.normalize(name))) return 'این اسم توی اتاق هست. یه اسم دیگه بزن.';
+    return null;
+  }
+
   socket.on('create', ({ playerId, name } = {}) => {
     name = cleanName(name);
-    if (!name) return fail('اسمت رو بنویس.');
-    if (hasBadWord(name)) return fail('این اسم مناسب نیست. یه اسم دیگه انتخاب کن 🙂');
-    if (typeof playerId !== 'string' || playerId.length > 64) return fail('شناسه نامعتبره.');
+    const problem = nameProblem(null, name);
+    if (problem) return fail(problem);
+    if (!validId(playerId)) return fail('شناسه نامعتبره.');
     const code = newCode();
-    const r = { code, hostId: playerId, players: new Map(), settings: { ...DEFAULT_SETTINGS }, phase: 'lobby', roundNo: 0, round: null, used: { word: new Set(), story: new Set() }, timer: null, deadline: null };
+    const r = { code, hostId: playerId, players: new Map(), settings: { ...DEFAULT_SETTINGS }, phase: 'lobby',
+      roundNo: 0, round: null, used: { word: new Set(), story: new Set() }, timer: null, deadline: null };
     rooms.set(code, r);
     r.players.set(playerId, { id: playerId, name, score: 0, connected: false });
     attach(r, r.players.get(playerId));
   });
 
   socket.on('join', ({ playerId, name, code } = {}) => {
-    code = String(code || '').trim().toUpperCase();
-    const r = rooms.get(code);
-    if (!r || r.local) return fail('اتاقی با این کد پیدا نشد.');
-    if (typeof playerId !== 'string' || playerId.length > 64) return fail('شناسه نامعتبره.');
+    const r = rooms.get(String(code || '').trim().toUpperCase());
+    if (!r) return fail('اتاقی با این کد پیدا نشد.');
+    if (!validId(playerId)) return fail('شناسه نامعتبره.');
     const existing = r.players.get(playerId);
     if (existing) return attach(r, existing);               // back after refresh / reconnect
     name = cleanName(name);
-    if (!name) return fail('اسمت رو بنویس.');
-    if (hasBadWord(name)) return fail('این اسم مناسب نیست. یه اسم دیگه انتخاب کن 🙂');
+    const problem = nameProblem(r, name);
+    if (problem) return fail(problem);
     if (r.phase !== 'lobby') return fail('این بازی شروع شده. صبر کن دور بعد تموم بشه.');
     if (r.players.size >= r.settings.maxPlayers) return fail(`اتاق پره (حداکثر ${r.settings.maxPlayers} نفر).`);
-    if ([...r.players.values()].some(p => normalize(p.name) === normalize(name))) return fail('این اسم توی اتاق هست. یه اسم دیگه بزن.');
     r.players.set(playerId, { id: playerId, name, score: 0, connected: false });
     attach(r, r.players.get(playerId));
   });
 
   socket.on('resume', ({ playerId, code } = {}) => {
     const r = rooms.get(String(code || '').toUpperCase());
-    if (r && r.local) return r.owner.id === playerId ? attachOwner(r) : socket.emit('gone');
     const p = r && r.players.get(playerId);
     if (!p) return socket.emit('gone');
     attach(r, p);
@@ -362,17 +199,17 @@ io.on('connection', socket => {
   socket.on('start', () => {
     if (!isHost() || !['lobby', 'end'].includes(room.phase)) return;
     if (connected(room).length < MIN_PLAYERS) return fail('حداقل ۲ نفر لازمه.');
-    // Players who left during the last game are dropped before a new one.
     for (const p of [...room.players.values()]) if (!p.connected) room.players.delete(p.id);
     startGame(room);
   });
 
   socket.on('again', () => {
-    if (!isHost() || room.phase !== 'end') return;
-    if (room.local) return startGame(room);
-    for (const p of [...room.players.values()]) { p.score = 0; if (!p.connected) room.players.delete(p.id); }
-    room.round = null; room.roundNo = 0;
-    setPhase(room, 'lobby', 0);
+    if (isHost() && room.phase === 'end') backToLobby(room);
+  });
+
+  // «شروع دوباره» in the middle of a game: the host stops it and everyone goes back to the lobby.
+  socket.on('restart', () => {
+    if (isHost() && room.phase !== 'lobby') backToLobby(room);
   });
 
   socket.on('skip', () => {
@@ -381,52 +218,34 @@ io.on('connection', socket => {
     else if (room.phase === 'scores') nextRound(room);
   });
 
-  socket.on('lie', (payload, ack) => {
+  socket.on('lie', (text, ack) => {
     ack = typeof ack === 'function' ? ack : () => {};
-    let [text, as] = unpack(payload, 'text');
-    if (!room || room.phase !== 'write') return ack({ ok: false, msg: 'وقت نوشتن تموم شده.' });
-    const who = actor(as);
-    if (!who) return ack({ ok: false });
-    if (room.local && turnOf(room) !== who) return ack({ ok: false, msg: 'الان نوبت یکی دیگه‌ست.' });
-    text = cleanText(text, maxLen(room));
-    if (!text) return ack({ ok: false, msg: 'یه چیزی بنویس!' });
-    if (hasBadWord(text)) return ack({ ok: false, msg: 'کلمه‌ی بد ممنوعه! یه دروغ مؤدبانه بنویس 😇' });
-    if (isCloseTo(text, room.round.q.answer)) {
-      return ack({ ok: false, msg: room.settings.mode === 'story' ? 'این همون داستان واقعیه! یه داستان دیگه بساز 🤫' : 'این جواب درسته! یه دروغ دیگه بنویس 🤫' });
-    }
-    if (room.settings.mode === 'story') {
-      text = casual(text);
-      if (!text) return ack({ ok: false, msg: 'یه چیزی بنویس!' });
-    }
-    room.round.lies[who.id] = { text, auto: false };
+    if (!room || !player || room.phase !== 'write') return ack({ ok: false, msg: 'وقت نوشتن تموم شده.' });
+    const raw = String(text || '');
+    const problem = core.lieProblem(room, raw.trim(), hasBadWord);
+    if (problem) return ack({ ok: false, msg: problem });
+    const clean = core.cleanLie(room, raw);
+    if (!clean) return ack({ ok: false, msg: 'یه چیزی بنویس!' });
+    room.round.lies[player.id] = { text: clean, auto: false };
     ack({ ok: true });
     broadcast(room);
     checkAllDone(room);
   });
 
-  socket.on('pick', (payload, ack) => {
+  socket.on('pick', (optionId, ack) => {
     ack = typeof ack === 'function' ? ack : () => {};
-    const [optionId, as] = unpack(payload, 'option');
-    if (!room || room.phase !== 'choose') return ack({ ok: false });
-    const who = actor(as);
-    if (!who) return ack({ ok: false });
-    if (room.local && turnOf(room) !== who) return ack({ ok: false, msg: 'الان نوبت یکی دیگه‌ست.' });
+    if (!room || !player || room.phase !== 'choose') return ack({ ok: false });
     const o = room.round.options.find(x => x.id === optionId);
     if (!o) return ack({ ok: false });
-    if (o.authors.includes(who.id)) return ack({ ok: false, msg: 'این دروغ خودته! 😄' });
-    room.round.picks[who.id] = optionId;
+    if (o.authors.includes(player.id)) return ack({ ok: false, msg: 'این دروغ خودته! 😄' });
+    room.round.picks[player.id] = optionId;
     ack({ ok: true });
     broadcast(room);
     checkAllDone(room);
   });
 
   socket.on('leave', () => {
-    if (!room) return;
-    if (room.local) {
-      if (isHost()) { clearTimer(room); rooms.delete(room.code); }
-      room = null;
-      return;
-    }
+    if (!room || !player) return;
     const r = room, p = player;
     room = null; player = null;
     if (r.phase === 'lobby' || r.phase === 'end') r.players.delete(p.id); else p.connected = false;
@@ -437,10 +256,6 @@ io.on('connection', socket => {
   });
 
   socket.on('disconnect', () => {
-    if (room && room.local) {
-      if (room.owner.socketId === socket.id) { room.owner.connected = false; scheduleRoomCleanup(room); }
-      return;
-    }
     if (!room || !player || player.socketId !== socket.id) return;
     const r = room, p = player;
     p.connected = false;
