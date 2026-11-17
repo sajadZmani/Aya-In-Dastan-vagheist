@@ -3,10 +3,10 @@
  * Network first (so updates arrive as soon as there is internet), the saved copy when offline.
  * The online rooms (socket.io) are never cached.
  */
-const CACHE = 'ayaa-v1';
+const CACHE = 'ayaa-v2';
 const FILES = [
   '/', '/index.html', '/style.css', '/app.js', '/core.js', '/manifest.webmanifest', '/icon.svg',
-  '/data/bank.json', '/data/blocklist.json',
+  '/data/blocklist.json',
   '/fonts/vazirmatn-arabic-400-normal.woff2', '/fonts/vazirmatn-arabic-700-normal.woff2',
   '/fonts/vazirmatn-arabic-900-normal.woff2', '/fonts/vazirmatn-latin-700-normal.woff2',
 ];

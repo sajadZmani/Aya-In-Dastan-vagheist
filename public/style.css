@@ -184,3 +184,18 @@ textarea { resize: none; line-height: 1.8; font-size: 18px; }
   box-shadow: 0 -10px 30px rgba(0,0,0,.2); animation: up .25s ease-out; }
 .sheet .btn:first-child { margin-top: 0; }
 @keyframes up { from { transform: translate(-50%, 100%); } }
+
+.said { font-size: 20px; font-weight: 900; line-height: 1.8; margin: 8px 0; }
+.tf { display: inline-block; border-radius: 99px; padding: 2px 10px; font-weight: 900; font-size: 14px; }
+.tf.yes { background: #dcfce7; color: #15803d; }
+.tf.no { background: #fee2e2; color: #b91c1c; }
+.tfpick { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.tfpick button { font: inherit; font-weight: 900; font-size: 18px; min-height: 54px; border-radius: 16px; border: 3px solid #e9e0fb; background: #faf7ff; color: var(--ink); cursor: pointer; }
+.tfpick.small button { min-height: 46px; font-size: 16px; }
+.tfpick button.on.yes { border-color: var(--green); background: #dcfce7; }
+.tfpick button.on.no { border-color: var(--red); background: #fee2e2; }
+.votes { display: grid; gap: 10px; }
+.vcard { background: #fff; border-radius: 18px; padding: 14px; box-shadow: 0 6px 0 rgba(0,0,0,.12); animation: pop .35s backwards; }
+.vcard .vt { font-weight: 700; font-size: 18px; line-height: 1.8; margin-bottom: 10px; }
+.vcard.mine { background: #f1ecfb; box-shadow: none; }
+.vcard.mine .vt { margin-bottom: 4px; color: var(--muted); }

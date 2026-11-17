@@ -3,8 +3,8 @@
  * The same file runs on the server (require) and in the browser (window.AyaCore), so online rooms
  * and the offline one-phone game follow exactly the same rules:
  *   - text: Persian normalising, "close enough" answers, the casual story look, the bad-word filter
- *   - bank: turning data/bank.json into questions for both modes
- *   - rounds: picking a question, filling in lies and options, scoring, the reveal and vote table
+ *   - rounds: sentences marked true/false, votes, scoring, the reveal and the round table
+ * (The old word and story question bank stays in data/bank.json but is not used for now.)
  */
 (function (root, factory) {
   if (typeof module === 'object' && module.exports) module.exports = factory();
@@ -137,31 +137,16 @@
     };
   }
 
-  // ---------- bank ----------
-  // Both modes in one shape: { id, kind, prompt, topic, answer, lies, extra }.
-  //  - word:  a sentence with a blank; the answer is one to three words.
-  //  - story: a topic; the answer is a whole true sentence. Ready-made fakes are the story's own twin
-  //    and the other fakes of its topic; `extra` (other topics' fake stories) is only a fallback.
-  function buildBank(raw) {
-    const words = raw.words.map(q => ({ id: 'w' + q.id, kind: 'word', prompt: q.question, topic: null, answer: q.answer, lies: q.lies.slice(), extra: [] }));
-    const byTopic = {};
-    const addFake = (topic, text) => (byTopic[topic] = byTopic[topic] || []).push(text);
-    for (const s of raw.stories) addFake(s.topic, s.fake);
-    for (const f of raw.fakes || []) addFake(f.topic, f.text);
-    const stories = raw.stories.map(s => ({
-      id: s.id, kind: 'story', prompt: s.topic, topic: s.topic, answer: casual(s.text),
-      lies: [s.fake, ...byTopic[s.topic].filter(f => f !== s.fake)].map(casual),
-      extra: (raw.fakes || []).filter(f => f.topic !== s.topic).map(f => casual(f.text)),
-    }));
-    return { word: words, story: stories };
-  }
-
   // ---------- rounds ----------
-  // A room is { players: Map(id -> {id, name, score}), settings: {mode, rounds}, roundNo, round, used }.
-  // `used` is { word: Set, story: Set } of question ids the room (or the phone) has had already.
-  const POINTS_TRUTH = 1000;
-  const POINTS_FOOLED = 500;
+  // Every round, each player writes one sentence about anything (themselves, a friend, a fact)
+  // and secretly marks it true or false. Everyone votes true/false on the others' sentences.
+  // Each wrong vote on your sentence is a point for you: whoever fools the most votes wins.
+  //
+  // A room is { players: Map(id -> {id, name, score}), settings: {rounds}, roundNo, round, phase }.
+  // round = { statements: {pid: {text, truth}}, votes: {pid: {sid: bool}}, order: [{id, author}],
+  //           reveal: [...], summary: [...], gains: {pid: n} }
   const REVEAL_STEP_SECONDS = 4.5;
+  const MAX_LEN = 160;
 
   function shuffle(arr) {
     const a = arr.slice();
@@ -172,96 +157,61 @@
     return a;
   }
 
-  // A question the room has not had yet; only when every one is used does the bank start over.
-  function pickQuestion(room, bank) {
-    const mode = room.settings.mode;
-    const used = room.used[mode];
-    let pool = bank[mode].filter(q => !used.has(q.id));
-    if (!pool.length) { used.clear(); pool = bank[mode].slice(); }
-    const q = pool[Math.floor(Math.random() * pool.length)];
-    used.add(q.id);
-    return q;
-  }
-
-  function newRound(room, bank) {
+  function newRound(room) {
     room.roundNo += 1;
-    room.round = { q: pickQuestion(room, bank), lies: {}, picks: {}, options: [], reveal: [], gains: {}, summary: null };
+    room.round = { statements: {}, votes: {}, order: [], reveal: [], summary: null, gains: {} };
   }
 
-  // Checks a lie; returns an error message, or null when it is fine.
-  function lieProblem(room, text, hasBadWord) {
-    if (!text) return 'یه چیزی بنویس!';
-    if (hasBadWord(text)) return 'کلمه‌ی بد ممنوعه! یه دروغ مؤدبانه بنویس 😇';
-    if (isCloseTo(text, room.round.q.answer)) {
-      return room.settings.mode === 'story' ? 'این همون داستان واقعیه! یه داستان دیگه بساز 🤫' : 'این جواب درسته! یه دروغ دیگه بنویس 🤫';
-    }
+  const cleanStatement = text => String(text || '').replace(/\s+/g, ' ').trim().slice(0, MAX_LEN);
+
+  // Checks a sentence; returns an error message, or null when it is fine.
+  function statementProblem(text, hasBadWord) {
+    if (!text) return 'یه جمله بنویس!';
+    if (compact(text).length < 4) return 'یه کم بیشتر بنویس 🙂';
+    if (hasBadWord(text)) return 'کلمه‌ی بد ممنوعه! یه جمله‌ی مؤدبانه بنویس 😇';
     return null;
   }
 
-  const cleanLie = (room, text) => {
-    const t = String(text || '').replace(/\s+/g, ' ').trim().slice(0, room.settings.mode === 'story' ? 160 : 40);
-    return room.settings.mode === 'story' ? casual(t) : t;
-  };
-
-  // End of writing: ready-made lies for whoever wrote nothing, same lies merged, then the options.
+  // End of writing: the sentences in random order, without names.
   function finishWriting(room) {
     const r = room.round;
-    const spare = shuffle(r.q.lies.filter(l => !Object.values(r.lies).some(x => compact(x.text) === compact(l))));
-    for (const p of room.players.values()) {
-      if (!r.lies[p.id] && spare.length) r.lies[p.id] = { text: spare.pop(), auto: true };
-    }
-    const byKey = new Map();
-    for (const [pid, lie] of Object.entries(r.lies)) {
-      const key = compact(lie.text);
-      if (!byKey.has(key)) byKey.set(key, { id: 'o' + byKey.size, text: lie.text, authors: [], truth: false });
-      byKey.get(key).authors.push(pid);
-    }
-    const lies = [...byKey.values()];
-    // With few players add ready-made lies: the question's own first, then the rest of its topic,
-    // then other topics. Story mode wants at least three lies so the real one is not easy to spot.
-    const want = room.settings.mode === 'story' ? 3 : 2;
-    for (const l of [r.q.lies[0], ...shuffle(r.q.lies.slice(1)), ...shuffle(r.q.extra || [])]) {
-      if (lies.length >= want) break;
-      if (!lies.some(x => compact(x.text) === compact(l))) lies.push({ id: 'o' + lies.length + 'h', text: l, authors: [], truth: false });
-    }
-    r.options = shuffle([...lies, { id: 'truth', text: r.q.answer, authors: [], truth: true }]);
+    r.order = shuffle(Object.keys(r.statements)).map((author, i) => ({ id: 's' + i, author }));
   }
 
-  // End of guessing: points, the reveal steps and the vote table. Returns the reveal's length in seconds.
-  function finishChoosing(room) {
+  // The sentences a player has to vote on: everyone's but their own.
+  const toVote = (room, pid) => room.round.order.filter(o => o.author !== pid);
+  const votedAll = (room, pid) => toVote(room, pid).every(o => typeof (room.round.votes[pid] || {})[o.id] === 'boolean');
+
+  // Keeps only real votes (true/false) on sentences that aren't the player's own.
+  function cleanVotes(room, pid, votes) {
+    const out = {};
+    for (const o of toVote(room, pid)) if (votes && typeof votes[o.id] === 'boolean') out[o.id] = votes[o.id];
+    return out;
+  }
+
+  // End of voting: points, the reveal steps and the round table. Returns the reveal's length in seconds.
+  function finishVoting(room) {
     const r = room.round;
-    const mult = room.roundNo === room.settings.rounds ? 2 : 1;
-    const gains = {};
-    const add = (pid, n) => { gains[pid] = (gains[pid] || 0) + n; };
-    const pickersOf = id => Object.keys(r.picks).filter(pid => r.picks[pid] === id);
     const name = pid => (room.players.get(pid) || { name: '؟' }).name;
-
-    const steps = [];
-    for (const o of r.options) {
-      if (o.truth) continue;
-      const pickers = pickersOf(o.id);
-      for (const a of o.authors) add(a, pickers.length * POINTS_FOOLED * mult);
-      if (pickers.length) steps.push({ text: o.text, truth: false, authors: o.authors.map(name), house: !o.authors.length, pickers: pickers.map(name), points: pickers.length * POINTS_FOOLED * mult });
-    }
-    const finders = pickersOf('truth');
-    finders.forEach(pid => add(pid, POINTS_TRUTH * mult));
-    const ordered = shuffle(steps);
-    ordered.push({ text: r.q.answer, truth: true, authors: [], pickers: finders.map(name), points: POINTS_TRUTH * mult });
-
+    const gains = {};
+    const steps = r.order.map(o => {
+      const st = r.statements[o.author];
+      const fooled = [], right = [];
+      for (const [pid, v] of Object.entries(r.votes)) {
+        if (pid === o.author || typeof v[o.id] !== 'boolean') continue;
+        (v[o.id] === st.truth ? right : fooled).push(name(pid));
+      }
+      gains[o.author] = (gains[o.author] || 0) + fooled.length;
+      return { text: st.text, truth: st.truth, author: name(o.author), authorId: o.author, fooled, right };
+    });
     for (const [pid, n] of Object.entries(gains)) {
       const p = room.players.get(pid);
       if (p) p.score += n;
     }
-    r.reveal = ordered;
-    r.summary = r.options.map(o => {
-      const voters = pickersOf(o.id);
-      return {
-        text: o.text, truth: o.truth, votes: voters.length, voters: voters.map(name),
-        authors: o.authors.map(a => name(a) + (r.lies[a] && r.lies[a].auto ? ' (خودکار)' : '')),
-      };
-    }).sort((x, y) => (y.truth - x.truth) || (y.votes - x.votes));
+    r.reveal = steps;
+    r.summary = steps.slice().sort((a, b) => b.fooled.length - a.fooled.length);
     r.gains = gains;
-    return Math.ceil(ordered.length * REVEAL_STEP_SECONDS + 1.5);
+    return steps.length ? Math.ceil(steps.length * REVEAL_STEP_SECONDS + 1.5) : 0;
   }
 
   // What a player's screen needs (without the room code and clock, which the caller adds).
@@ -274,27 +224,22 @@
       settings: room.settings,
       roundNo: room.roundNo,
       totalRounds: room.settings.rounds,
-      double: room.roundNo === room.settings.rounds,
       deadline: room.deadline,
       players: [...room.players.values()].map(p => ({
         id: p.id, name: p.name, score: p.score, connected: p.connected !== false,
-        done: r ? (room.phase === 'write' ? !!r.lies[p.id] : room.phase === 'choose' ? !!r.picks[p.id] : false) : false,
+        done: r ? (room.phase === 'write' ? !!r.statements[p.id] : room.phase === 'vote' ? votedAll(room, p.id) && !!r.votes[p.id] : false) : false,
       })),
       me: me ? { id: me.id, name: me.name } : null,
     };
     if (r) {
-      s.question = r.q.prompt;
-      s.kind = r.q.kind;
-      s.topic = r.q.topic || null;
-      if (room.phase === 'write') s.myLie = r.lies[forId] ? r.lies[forId].text : null;
-      if (room.phase === 'choose') {
-        s.options = r.options.map(o => ({ id: o.id, text: o.text, mine: o.authors.includes(forId) }));
-        s.myPick = r.picks[forId] || null;
+      if (room.phase === 'write') s.mine = r.statements[forId] || null;
+      if (room.phase === 'vote') {
+        s.statements = r.order.map(o => ({ id: o.id, text: r.statements[o.author].text, mine: o.author === forId }));
+        s.myVotes = r.votes[forId] || null;
       }
       if (room.phase === 'reveal' || room.phase === 'scores' || room.phase === 'end') {
         s.reveal = r.reveal;
         s.gains = r.gains;
-        s.answer = r.q.answer;
         s.summary = r.summary;
       }
     }
@@ -303,7 +248,7 @@
 
   return {
     normalize, compact, isCloseTo, casual, sha256hex, badWordChecker,
-    buildBank, shuffle, pickQuestion, newRound, lieProblem, cleanLie, finishWriting, finishChoosing, viewState,
+    shuffle, newRound, cleanStatement, statementProblem, finishWriting, toVote, votedAll, cleanVotes, finishVoting, viewState,
     REVEAL_STEP_SECONDS,
   };
 });

@@ -2,7 +2,7 @@
 /*
  * «آیا این داستان واقعیست؟» — server for online rooms (one phone per player).
  * The server owns every room's state and runs all the timers; clients only send actions and draw
- * the state they receive. Rooms live in memory (no database). The rules themselves (lies, options,
+ * the state they receive. Rooms live in memory (no database). The rules themselves (sentences, votes,
  * scoring, the reveal) are in public/core.js, which the offline one-phone game uses too.
  */
 const path = require('path');
@@ -12,7 +12,6 @@ const express = require('express');
 const { Server } = require('socket.io');
 const core = require('./public/core.js');
 
-const BANK = core.buildBank(require('./data/bank.json'));
 const hasBadWord = core.badWordChecker(require('./data/blocklist.json'));
 
 const PORT = process.env.PORT || 3000;
@@ -21,12 +20,12 @@ const MIN_PLAYERS = 2;
 const EMPTY_ROOM_TTL = 5 * 60 * 1000;   // a room with nobody connected is removed after this
 const LOBBY_DROP_MS = 45 * 1000;        // a player who leaves the lobby is removed after this
 const LETTERS = 'ABCDEFGHJKLMNPQRSTUVWXYZ';  // no I/O, they look like 1/0
-const DEFAULT_SETTINGS = { mode: 'word', rounds: 7, writeSec: 60, chooseSec: 30, maxPlayers: 10 };
+const DEFAULT_SETTINGS = { rounds: 3, writeSec: 90, chooseSec: 60, maxPlayers: 10 };
 const LIMITS = { rounds: [1, 30], writeSec: [15, 300], chooseSec: [10, 180], maxPlayers: [2, 50] };
 
 const app = express();
 app.use(express.static(path.join(__dirname, 'public')));
-// The bank and the hashed bad-word list, for the offline one-phone game.
+// The hashed bad-word list, for the offline one-phone game (data/bank.json is kept but not used now).
 app.use('/data', express.static(path.join(__dirname, 'data')));
 app.get('/health', (_req, res) => res.send('ok'));
 const server = http.createServer(app);
@@ -74,17 +73,20 @@ function startGame(room) {
 }
 
 function nextRound(room) {
-  core.newRound(room, BANK);
+  core.newRound(room);
   setPhase(room, 'write', room.settings.writeSec, () => endWriting(room));
 }
 
 function endWriting(room) {
   core.finishWriting(room);
-  setPhase(room, 'choose', room.settings.chooseSec, () => endChoosing(room));
+  // Nobody to vote on (fewer than two sentences): straight to the scores.
+  if (room.round.order.length < 2) { core.finishVoting(room); return showScores(room); }
+  setPhase(room, 'vote', room.settings.chooseSec, () => endVoting(room));
 }
 
-function endChoosing(room) {
-  const seconds = core.finishChoosing(room);
+function endVoting(room) {
+  const seconds = core.finishVoting(room);
+  if (!seconds) return showScores(room);
   setPhase(room, 'reveal', seconds, () => showScores(room));
 }
 
@@ -104,8 +106,8 @@ function backToLobby(room) {
 function checkAllDone(room) {
   const r = room.round, on = connected(room);
   if (!r || !on.length) return;
-  if (room.phase === 'write' && on.every(p => r.lies[p.id])) endWriting(room);
-  else if (room.phase === 'choose' && on.every(p => r.picks[p.id])) endChoosing(room);
+  if (room.phase === 'write' && on.every(p => r.statements[p.id])) endWriting(room);
+  else if (room.phase === 'vote' && on.every(p => r.votes[p.id] && core.votedAll(room, p.id))) endVoting(room);
 }
 
 function ensureHost(room) {
@@ -157,7 +159,7 @@ io.on('connection', socket => {
     if (!validId(playerId)) return fail('شناسه نامعتبره.');
     const code = newCode();
     const r = { code, hostId: playerId, players: new Map(), settings: { ...DEFAULT_SETTINGS }, phase: 'lobby',
-      roundNo: 0, round: null, used: { word: new Set(), story: new Set() }, timer: null, deadline: null };
+      roundNo: 0, round: null, timer: null, deadline: null };
     rooms.set(code, r);
     r.players.set(playerId, { id: playerId, name, score: 0, connected: false });
     attach(r, r.players.get(playerId));
@@ -187,7 +189,6 @@ io.on('connection', socket => {
 
   socket.on('settings', (patch = {}) => {
     if (!isHost() || room.phase !== 'lobby') return;
-    if (patch.mode === 'word' || patch.mode === 'story') room.settings.mode = patch.mode;
     for (const [k, [lo, hi]] of Object.entries(LIMITS)) {
       const v = parseInt(patch[k], 10);
       if (v >= lo && v <= hi) room.settings[k] = v;
@@ -218,27 +219,30 @@ io.on('connection', socket => {
     else if (room.phase === 'scores') nextRound(room);
   });
 
-  socket.on('lie', (text, ack) => {
+  // A sentence and whether it is true (the others don't see that until the reveal).
+  socket.on('statement', ({ text, truth } = {}, ack) => {
     ack = typeof ack === 'function' ? ack : () => {};
     if (!room || !player || room.phase !== 'write') return ack({ ok: false, msg: 'وقت نوشتن تموم شده.' });
-    const raw = String(text || '');
-    const problem = core.lieProblem(room, raw.trim(), hasBadWord);
+    if (typeof truth !== 'boolean') return ack({ ok: false, msg: 'بگو این جمله راسته یا دروغ ✅❌' });
+    const clean = core.cleanStatement(text);
+    const problem = core.statementProblem(clean, hasBadWord);
     if (problem) return ack({ ok: false, msg: problem });
-    const clean = core.cleanLie(room, raw);
-    if (!clean) return ack({ ok: false, msg: 'یه چیزی بنویس!' });
-    room.round.lies[player.id] = { text: clean, auto: false };
+    room.round.statements[player.id] = { text: clean, truth };
     ack({ ok: true });
     broadcast(room);
     checkAllDone(room);
   });
 
-  socket.on('pick', (optionId, ack) => {
+  // All of a player's votes at once: { sentenceId: true/false }.
+  socket.on('votes', (votes, ack) => {
     ack = typeof ack === 'function' ? ack : () => {};
-    if (!room || !player || room.phase !== 'choose') return ack({ ok: false });
-    const o = room.round.options.find(x => x.id === optionId);
-    if (!o) return ack({ ok: false });
-    if (o.authors.includes(player.id)) return ack({ ok: false, msg: 'این دروغ خودته! 😄' });
-    room.round.picks[player.id] = optionId;
+    if (!room || !player || room.phase !== 'vote') return ack({ ok: false, msg: 'وقت رأی دادن تموم شده.' });
+    const prev = room.round.votes[player.id];
+    room.round.votes[player.id] = core.cleanVotes(room, player.id, votes);
+    if (!core.votedAll(room, player.id)) {                 // only a full set of votes is kept
+      if (prev) room.round.votes[player.id] = prev; else delete room.round.votes[player.id];
+      return ack({ ok: false, msg: 'به همه‌ی جمله‌ها رأی بده 🙂' });
+    }
     ack({ ok: true });
     broadcast(room);
     checkAllDone(room);
