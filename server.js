@@ -1,7 +1,7 @@
 'use strict';
 /*
  * «آیا این داستان واقعیست؟» — server for online rooms (one phone per player).
- * The server owns every room's state and runs all the timers; clients only send actions and draw
+ * The server owns every room's state; clients only send actions and draw
  * the state they receive. Rooms live in memory (no database). The rules themselves (sentences, votes,
  * scoring, the reveal) are in public/core.js, which the offline one-phone game uses too.
  */
@@ -15,13 +15,12 @@ const core = require('./public/core.js');
 const hasBadWord = core.badWordChecker(require('./data/blocklist.json'));
 
 const PORT = process.env.PORT || 3000;
-const SCORES_SECONDS = Number(process.env.SCORES_SECONDS) || 9;
 const MIN_PLAYERS = 2;
 const EMPTY_ROOM_TTL = 5 * 60 * 1000;   // a room with nobody connected is removed after this
 const LOBBY_DROP_MS = 45 * 1000;        // a player who leaves the lobby is removed after this
 const LETTERS = 'ABCDEFGHJKLMNPQRSTUVWXYZ';  // no I/O, they look like 1/0
-const DEFAULT_SETTINGS = { rounds: 3, writeSec: 90, chooseSec: 60, maxPlayers: 10 };
-const LIMITS = { rounds: [1, 30], writeSec: [15, 300], chooseSec: [10, 180], maxPlayers: [2, 50] };
+const DEFAULT_SETTINGS = { rounds: 3, maxPlayers: 10 };
+const LIMITS = { rounds: [1, 30], maxPlayers: [2, 50] };
 
 const app = express();
 app.use(express.static(path.join(__dirname, 'public')));
@@ -45,16 +44,10 @@ function newCode() {
 const cleanName = s => String(s || '').replace(/\s+/g, ' ').trim().slice(0, 16);
 const connected = room => [...room.players.values()].filter(p => p.connected);
 
-function clearTimer(room) {
-  if (room.timer) clearTimeout(room.timer);
-  room.timer = null;
-}
-
-function setPhase(room, phase, seconds, next) {
-  clearTimer(room);
+// Nothing runs on a timer: the game waits for everyone to write and vote, and moves on only when
+// the host presses «بعدی».
+function setPhase(room, phase) {
   room.phase = phase;
-  room.deadline = seconds ? Date.now() + seconds * 1000 : null;
-  if (seconds) room.timer = setTimeout(next, seconds * 1000);
   broadcast(room);
 }
 
@@ -74,40 +67,34 @@ function startGame(room) {
 
 function nextRound(room) {
   core.newRound(room);
-  setPhase(room, 'write', room.settings.writeSec, () => endWriting(room));
+  setPhase(room, 'write');
 }
 
-function endWriting(room) {
-  core.finishWriting(room);
-  // Nobody to vote on (fewer than two sentences): straight to the scores.
-  if (room.round.order.length < 2) { core.finishVoting(room); return showScores(room); }
-  setPhase(room, 'vote', room.settings.chooseSec, () => endVoting(room));
-}
-
-function endVoting(room) {
-  const seconds = core.finishVoting(room);
-  if (!seconds) return showScores(room);
-  setPhase(room, 'reveal', seconds, () => showScores(room));
-}
-
-function showScores(room) {
-  if (room.roundNo >= room.settings.rounds) return setPhase(room, 'end', 0);
-  setPhase(room, 'scores', SCORES_SECONDS, () => nextRound(room));
+// What «بعدی» does in each phase (host only). Writing and voting move on only once everyone is done.
+function next(room) {
+  const r = room.round;
+  if (room.phase === 'write') {
+    if (!core.allDone(room)) return 'هنوز همه ننوشتن ✍️';
+    core.finishWriting(room);
+    setPhase(room, 'vote');
+  } else if (room.phase === 'vote') {
+    if (!core.allDone(room)) return 'هنوز همه رأی ندادن 🗳️';
+    core.finishVoting(room);
+    setPhase(room, 'reveal');
+  } else if (room.phase === 'reveal') {
+    if (r.revealStep < r.reveal.length - 1) { r.revealStep += 1; broadcast(room); }
+    else setPhase(room, room.roundNo >= room.settings.rounds ? 'end' : 'scores');
+  } else if (room.phase === 'scores') {
+    nextRound(room);
+  }
+  return null;
 }
 
 // Back to the lobby with the same players, scores cleared (used by «بازی دوباره» and «شروع دوباره»).
 function backToLobby(room) {
   for (const p of [...room.players.values()]) { p.score = 0; if (!p.connected) room.players.delete(p.id); }
   room.round = null; room.roundNo = 0;
-  setPhase(room, 'lobby', 0);
-}
-
-// Move on early when every connected player is done.
-function checkAllDone(room) {
-  const r = room.round, on = connected(room);
-  if (!r || !on.length) return;
-  if (room.phase === 'write' && on.every(p => r.statements[p.id])) endWriting(room);
-  else if (room.phase === 'vote' && on.every(p => r.votes[p.id] && core.votedAll(room, p.id))) endVoting(room);
+  setPhase(room, 'lobby');
 }
 
 function ensureHost(room) {
@@ -123,7 +110,6 @@ function scheduleRoomCleanup(room) {
   if (connected(room).length) return;
   room.cleanup = setTimeout(() => {
     if (connected(room).length) return;
-    clearTimer(room);
     rooms.delete(room.code);
   }, EMPTY_ROOM_TTL);
 }
@@ -159,7 +145,7 @@ io.on('connection', socket => {
     if (!validId(playerId)) return fail('شناسه نامعتبره.');
     const code = newCode();
     const r = { code, hostId: playerId, players: new Map(), settings: { ...DEFAULT_SETTINGS }, phase: 'lobby',
-      roundNo: 0, round: null, timer: null, deadline: null };
+      roundNo: 0, round: null };
     rooms.set(code, r);
     r.players.set(playerId, { id: playerId, name, score: 0, connected: false });
     attach(r, r.players.get(playerId));
@@ -213,10 +199,10 @@ io.on('connection', socket => {
     if (isHost() && room.phase !== 'lobby') backToLobby(room);
   });
 
-  socket.on('skip', () => {
+  socket.on('next', () => {
     if (!isHost()) return;
-    if (room.phase === 'reveal') showScores(room);
-    else if (room.phase === 'scores') nextRound(room);
+    const problem = next(room);
+    if (problem) fail(problem);
   });
 
   // A sentence and whether it is true (the others don't see that until the reveal).
@@ -230,7 +216,6 @@ io.on('connection', socket => {
     room.round.statements[player.id] = { text: clean, truth };
     ack({ ok: true });
     broadcast(room);
-    checkAllDone(room);
   });
 
   // All of a player's votes at once: { sentenceId: true/false }.
@@ -245,18 +230,18 @@ io.on('connection', socket => {
     }
     ack({ ok: true });
     broadcast(room);
-    checkAllDone(room);
   });
 
   socket.on('leave', () => {
     if (!room || !player) return;
     const r = room, p = player;
     room = null; player = null;
-    if (r.phase === 'lobby' || r.phase === 'end') r.players.delete(p.id); else p.connected = false;
+    // Leaving takes the player out of the game, so nobody waits for them to write or vote.
+    r.players.delete(p.id);
+    if (r.phase !== 'lobby' && r.phase !== 'end') core.removeFromRound(r, p.id);
     ensureHost(r);
     scheduleRoomCleanup(r);
     broadcast(r);
-    checkAllDone(r);
   });
 
   socket.on('disconnect', () => {
@@ -271,7 +256,6 @@ io.on('connection', socket => {
     ensureHost(r);
     scheduleRoomCleanup(r);
     broadcast(r);
-    checkAllDone(r);
   });
 });
 

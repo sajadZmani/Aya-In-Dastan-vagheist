@@ -17,7 +17,6 @@ const netbar = document.getElementById('netbar');
 const fa = n => String(n).replace(/\d/g, d => '۰۱۲۳۴۵۶۷۸۹'[d]);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const COLORS = ['#8b5cf6', '#ec4899', '#f59e0b', '#22c55e', '#3b82f6', '#ef4444', '#14b8a6', '#f97316', '#a855f7', '#0ea5e9'];
-const REVEAL_STEP = AyaCore.REVEAL_STEP_SECONDS * 1000;
 const MAX_LEN = 160;
 
 // ---------- storage (wrapped: private windows can throw) ----------
@@ -33,7 +32,6 @@ if (!playerId) {
 }
 
 let state = null;       // last state (from the server, or from the offline game)
-let clockOffset = 0;    // server time - local time
 let lastKey = '';
 let showRules = false;
 let confettiDone = false;
@@ -60,8 +58,7 @@ function toast(msg) {
 // around, and there are no timers for writing and voting. Saved after every step, so a refresh
 // or a closed tab carries on where it was.
 const Offline = (() => {
-  let hasBadWord = null, room = null, timer = null;
-  const SCORES_SECONDS = 9;
+  let hasBadWord = null, room = null;
 
   async function load() {
     if (hasBadWord) return;
@@ -95,26 +92,22 @@ const Offline = (() => {
     applyState(s);
   }
 
-  function setPhase(phase, seconds) {
-    clearTimeout(timer);
-    room.phase = phase;
-    room.deadline = seconds ? Date.now() + seconds * 1000 : null;
-    schedule();
-    push();
-  }
+  function setPhase(phase) { room.phase = phase; push(); }
+  function nextRound() { AyaCore.newRound(room); setPhase('write'); }
 
-  // Timers only run between rounds (reveal, scores); after a refresh they pick up where they were.
-  function schedule() {
-    clearTimeout(timer);
-    if (!room.deadline) return;
-    const next = room.phase === 'reveal' ? showScores : room.phase === 'scores' ? nextRound : null;
-    if (next) timer = setTimeout(next, Math.max(0, room.deadline - Date.now()));
-  }
-
-  function nextRound() { AyaCore.newRound(room); setPhase('write', 0); }
-  function showScores() {
-    if (room.roundNo >= room.settings.rounds) return setPhase('end', 0);
-    setPhase('scores', SCORES_SECONDS);
+  // «بعدی»: the same steps as on the server.
+  function next() {
+    const r = room.round;
+    if (room.phase === 'write') {
+      if (!AyaCore.allDone(room)) return toast('هنوز همه ننوشتن ✍️');
+      AyaCore.finishWriting(room); setPhase('vote');
+    } else if (room.phase === 'vote') {
+      if (!AyaCore.allDone(room)) return toast('هنوز همه رأی ندادن 🗳️');
+      AyaCore.finishVoting(room); setPhase('reveal');
+    } else if (room.phase === 'reveal') {
+      if (r.revealStep < r.reveal.length - 1) { r.revealStep += 1; push(); }
+      else setPhase(room.roundNo >= room.settings.rounds ? 'end' : 'scores');
+    } else if (room.phase === 'scores') nextRound();
   }
 
   async function start(names, settings) {
@@ -122,7 +115,7 @@ const Offline = (() => {
     room = {
       players: new Map(names.map((name, i) => ['p' + i, { id: 'p' + i, name, score: 0 }])),
       settings: { rounds: settings.rounds },
-      hostId: 'me', phase: 'write', roundNo: 0, round: null, deadline: null,
+      hostId: 'me', phase: 'write', roundNo: 0, round: null,
     };
     nextRound();
   }
@@ -133,12 +126,11 @@ const Offline = (() => {
     if (!saved || !saved.round || !saved.round.statements) return false;   // nothing, or a game of the old kind
     await load();
     room = { ...saved, players: new Map(saved.players.map(p => [p.id, p])) };
-    schedule();
     push();
     return true;
   }
 
-  function quit() { clearTimeout(timer); room = null; save(); }
+  function quit() { room = null; save(); }
 
   // The same actions the server takes from a socket.
   function handle(event, payload, ack) {
@@ -153,18 +145,13 @@ const Offline = (() => {
       if (problem) return ack({ ok: false, msg: problem });
       room.round.statements[t.id] = { text: clean, truth };
       ack({ ok: true });
-      if (turn()) return push();
-      AyaCore.finishWriting(room);
-      setPhase('vote', 0);
+      push();
     } else if (event === 'votes' && room.phase === 'vote' && t) {
       room.round.votes[t.id] = AyaCore.cleanVotes(room, t.id, payload);
       if (!AyaCore.votedAll(room, t.id)) return ack({ ok: false, msg: 'به همه‌ی جمله‌ها رأی بده 🙂' });
       ack({ ok: true });
-      if (turn()) return push();
-      setPhase('reveal', AyaCore.finishVoting(room));
-    } else if (event === 'skip') {
-      if (room.phase === 'reveal') showScores(); else if (room.phase === 'scores') nextRound();
-    } else if (event === 'again' || event === 'restart') {
+      push();
+    } else if (event === 'next') next(); else if (event === 'again' || event === 'restart') {
       for (const p of room.players.values()) p.score = 0;
       room.roundNo = 0;
       nextRound();
@@ -182,7 +169,6 @@ function send(event, payload, ack) {
 }
 
 function applyState(s) {
-  clockOffset = s.now - Date.now();
   const turnId = s.turn ? s.turn.id : null;
   if (!state || state.phase !== s.phase || state.roundNo !== s.roundNo || (state.turn ? state.turn.id : null) !== turnId) {
     if (!state || state.phase !== s.phase) { confettiDone = false; showMenu = false; }
@@ -224,30 +210,23 @@ function refresh() {
 document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
 window.addEventListener('online', refresh);
 window.addEventListener('pageshow', refresh);
-// Watchdog: if a phase's time ran out a few seconds ago and nothing new came, fetch the state.
-setInterval(() => {
-  if (state && !state.offline && state.deadline && Date.now() + clockOffset > state.deadline + 5000) refresh();
-}, 2000);
 
 // ---------- helpers ----------
 const isHost = () => state && state.me && state.hostId === state.me.id;
-const secondsLeft = () => state && state.deadline ? Math.max(0, Math.ceil((state.deadline - (Date.now() + clockOffset)) / 1000)) : 0;
 const av = (name, i) => `<span class="av" style="background:${COLORS[i % COLORS.length]}">${esc([...name][0] || '?')}</span>`;
 const names = list => list.length === 1 ? list[0] : list.slice(0, -1).join('، ') + ' و ' + list[list.length - 1];
 const youName = () => state.local && state.turn ? esc(state.turn.name) + '، ' : '';
 
 function revealIndex() {
-  if (!state || state.phase !== 'reveal' || !state.reveal || !state.reveal.length) return 0;
-  const total = Math.ceil(state.reveal.length * REVEAL_STEP / 1000 + 1.5) * 1000;
-  const elapsed = Date.now() + clockOffset - (state.deadline - total);
-  return Math.max(0, Math.min(state.reveal.length - 1, Math.floor(elapsed / REVEAL_STEP)));
+  if (!state || !state.reveal || !state.reveal.length) return 0;
+  return Math.min(state.revealStep || 0, state.reveal.length - 1);
 }
 
 // Redraw only when what is on screen really changes, so typing is never interrupted.
 function viewKey() {
   if (!state) return setup ? 'setup|' + setup.names.length + '|' + setup.rounds : 'home' + showRules;
   const s = state;
-  const base = [s.phase, s.roundNo, s.hostId, showMenu];
+  const base = [s.phase, s.roundNo, s.hostId, showMenu, s.allDone];
   if (s.phase === 'lobby') base.push(JSON.stringify(s.settings), JSON.stringify(s.players.map(p => [p.name, p.connected])));
   if (s.local && s.turn) base.push(s.turn.id, gate === s.turn.id);
   if (s.phase === 'write') base.push(JSON.stringify(s.mine), editing, draft.truth);
@@ -269,17 +248,8 @@ function render(force) {
   tick();
 }
 
-// Updates the timer and the "who is done" list without redrawing the rest.
+// Updates the "who is done" list without redrawing the rest.
 function tick() {
-  const t = document.querySelector('.timer > div');
-  const sec = document.querySelector('.secs');
-  if (t && state && state.deadline) {
-    const total = state.phase === 'write' ? state.settings.writeSec : state.phase === 'vote' ? state.settings.chooseSec : 9;
-    const left = secondsLeft();
-    t.style.width = Math.min(100, left / total * 100) + '%';
-    t.parentElement.classList.toggle('low', left <= 10);
-    if (sec) sec.textContent = fa(left);
-  }
   const ul = document.getElementById('donelist');
   if (ul && state) {
     const html = state.players.map((p, i) => `<li class="${p.done ? 'done' : ''} ${p.connected ? '' : 'off'}">${av(p.name, i)}<span class="nm">${esc(p.name)}</span></li>`).join('');
@@ -288,7 +258,7 @@ function tick() {
 }
 render(true);
 Offline.restore().catch(() => {});
-setInterval(() => { if (state && state.phase === 'reveal') render(); else tick(); }, 250);
+setInterval(tick, 500);
 
 // Keeps the site's files on the phone so the one-phone game opens without internet.
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
@@ -378,8 +348,6 @@ function lobby() {
   <div class="card">
     <h2>⚙️ تنظیمات بازی</h2>
     ${setting('rounds', 'تعداد راندها', fa(st.rounds), 1)}
-    ${setting('writeSec', 'زمان نوشتن', fa(st.writeSec) + ' ثانیه', 15)}
-    ${setting('chooseSec', 'زمان رأی دادن', fa(st.chooseSec) + ' ثانیه', 15)}
     ${setting('maxPlayers', 'حداکثر بازیکن', fa(st.maxPlayers) + ' نفر', 1)}
   </div>
   <div class="card center">
@@ -407,19 +375,30 @@ function menuHtml() {
 
 function topbar() {
   const s = state;
-  const timed = s.deadline && (s.phase === 'write' || s.phase === 'vote');
   return `${menuHtml()}<div class="topbar">
     <button class="pill menu-btn" data-act="menu" aria-label="منو">⋯</button>
     <span class="pill">راند ${fa(s.roundNo)} از ${fa(s.totalRounds)}</span>
-    ${timed ? '<span class="secs"></span>' : ''}
-  </div>
-  ${timed ? '<div class="timer"><div></div></div>' : ''}`;
+  </div>`;
+}
+
+// The «بعدی» button: online only the host has it, on one phone whoever holds it.
+const nextBtn = label => isHost()
+  ? `<button class="btn green" data-act="next">${label}</button>`
+  : '<div class="waiting">منتظر میزبان 👑<span class="dots"></span></div>';
+
+// Everyone has written / voted: nothing happens until someone presses «بعدی».
+function allDoneScreen(title, label) {
+  return `${topbar()}
+  <div class="card center"><div class="said" style="font-size:24px">${title}</div></div>
+  ${nextBtn(label)}
+  <div class="card" style="margin-top:16px"><ul class="players" id="donelist"></ul></div>`;
 }
 
 const truthBadge = t => t ? '<span class="tf yes">✅ راست</span>' : '<span class="tf no">❌ دروغ</span>';
 
 function write() {
   const s = state;
+  if (s.allDone) return allDoneScreen('همه نوشتن! ✍️', '▶ بریم رأی بدیم');
   if (s.mine && !editing) {
     return `${topbar()}
     <div class="card center"><div class="muted">جمله‌ت ثبت شد 😈</div>
@@ -446,6 +425,7 @@ function write() {
 
 function vote() {
   const s = state;
+  if (s.allDone) return allDoneScreen('همه رأی دادن! 🗳️', '▶ بریم سراغ جواب‌ها');
   const sent = s.myVotes && Object.keys(s.myVotes).length && !s.local;
   if (sent) {
     return `${topbar()}
@@ -484,7 +464,7 @@ function reveal() {
     ${step.fooled.length ? `<div><span class="plus">+${fa(step.fooled.length)} برای ${esc(step.author)}</span></div>` : ''}
     <div class="progress-dots">${dots}</div>
   </div>
-  ${isHost() ? '<button class="linkbtn" data-act="skip">رد شدن ⏭</button>' : ''}`;
+  ${nextBtn(i < s.reveal.length - 1 ? '▶ جمله‌ی بعدی' : s.roundNo >= s.totalRounds ? '🏆 نتیجه‌ی نهایی' : '▶ جدول امتیاز')}`;
 }
 
 function boardHtml(showGain) {
@@ -515,8 +495,7 @@ function scores() {
   return `${topbar()}
   ${summaryHtml()}
   <div class="card"><h2>🏆 جدول امتیاز</h2><p class="muted small" style="margin-top:-6px">هر 😈 یعنی یه نفر رو گول زده</p>${boardHtml(true)}</div>
-  <div class="waiting">راند بعدی تا چند لحظه‌ی دیگه<span class="dots"></span></div>
-  ${isHost() ? '<button class="linkbtn" data-act="skip">برو راند بعد ⏭</button>' : ''}`;
+  ${nextBtn('▶ راند بعدی')}`;
 }
 
 function end() {
@@ -603,7 +582,7 @@ function bind() {
     else if (act === 'sendvotes') {
       send('votes', voteDraft, res => { if (res && !res.ok && res.msg) toast(res.msg); });
     }
-    else if (act === 'skip') send('skip');
+    else if (act === 'next') send('next');
     else if (act === 'again') send('again');
     else if (act === 'share') {
       const url = location.origin + '/?room=' + state.code;

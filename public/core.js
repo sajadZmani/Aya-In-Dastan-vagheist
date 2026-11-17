@@ -145,7 +145,6 @@
   // A room is { players: Map(id -> {id, name, score}), settings: {rounds}, roundNo, round, phase }.
   // round = { statements: {pid: {text, truth}}, votes: {pid: {sid: bool}}, order: [{id, author}],
   //           reveal: [...], summary: [...], gains: {pid: n} }
-  const REVEAL_STEP_SECONDS = 4.5;
   const MAX_LEN = 160;
 
   function shuffle(arr) {
@@ -159,7 +158,7 @@
 
   function newRound(room) {
     room.roundNo += 1;
-    room.round = { statements: {}, votes: {}, order: [], reveal: [], summary: null, gains: {} };
+    room.round = { statements: {}, votes: {}, order: [], reveal: [], revealStep: 0, summary: null, gains: {} };
   }
 
   const cleanStatement = text => String(text || '').replace(/\s+/g, ' ').trim().slice(0, MAX_LEN);
@@ -189,7 +188,30 @@
     return out;
   }
 
-  // End of voting: points, the reveal steps and the round table. Returns the reveal's length in seconds.
+  // Everyone has written (write phase) or voted on every sentence (vote phase). Nothing moves on
+  // by itself: when this is true, someone presses «بعدی».
+  function allDone(room) {
+    const r = room.round, list = [...room.players.values()];
+    if (!r || !list.length) return false;
+    if (room.phase === 'write') return list.every(p => r.statements[p.id]);
+    if (room.phase === 'vote') return list.every(p => r.votes[p.id] && votedAll(room, p.id));
+    return false;
+  }
+
+  // A player who leaves in the middle of a game is taken out of the round too.
+  function removeFromRound(room, pid) {
+    const r = room.round;
+    if (!r) return;
+    delete r.statements[pid];
+    delete r.votes[pid];
+    if (room.phase === 'vote') {
+      const gone = r.order.filter(o => o.author === pid).map(o => o.id);
+      r.order = r.order.filter(o => o.author !== pid);
+      for (const v of Object.values(r.votes)) for (const id of gone) delete v[id];
+    }
+  }
+
+  // End of voting: points, the reveal steps (shown one by one with «بعدی») and the round table.
   function finishVoting(room) {
     const r = room.round;
     const name = pid => (room.players.get(pid) || { name: '؟' }).name;
@@ -211,7 +233,7 @@
     r.reveal = steps;
     r.summary = steps.slice().sort((a, b) => b.fooled.length - a.fooled.length);
     r.gains = gains;
-    return steps.length ? Math.ceil(steps.length * REVEAL_STEP_SECONDS + 1.5) : 0;
+    r.revealStep = 0;
   }
 
   // What a player's screen needs (without the room code and clock, which the caller adds).
@@ -224,7 +246,7 @@
       settings: room.settings,
       roundNo: room.roundNo,
       totalRounds: room.settings.rounds,
-      deadline: room.deadline,
+      allDone: allDone(room),
       players: [...room.players.values()].map(p => ({
         id: p.id, name: p.name, score: p.score, connected: p.connected !== false,
         done: r ? (room.phase === 'write' ? !!r.statements[p.id] : room.phase === 'vote' ? votedAll(room, p.id) && !!r.votes[p.id] : false) : false,
@@ -239,6 +261,7 @@
       }
       if (room.phase === 'reveal' || room.phase === 'scores' || room.phase === 'end') {
         s.reveal = r.reveal;
+        s.revealStep = r.revealStep || 0;
         s.gains = r.gains;
         s.summary = r.summary;
       }
@@ -248,7 +271,7 @@
 
   return {
     normalize, compact, isCloseTo, casual, sha256hex, badWordChecker,
-    shuffle, newRound, cleanStatement, statementProblem, finishWriting, toVote, votedAll, cleanVotes, finishVoting, viewState,
-    REVEAL_STEP_SECONDS,
+    shuffle, newRound, cleanStatement, statementProblem, finishWriting, toVote, votedAll, cleanVotes, allDone, removeFromRound,
+    finishVoting, viewState,
   };
 });
