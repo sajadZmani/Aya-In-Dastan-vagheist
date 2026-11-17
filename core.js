@@ -1,7 +1,6 @@
 /*
  * «آیا این داستان واقعیست؟» — the shared core.
- * The same file runs on the server (require) and in the browser (window.AyaCore), so online rooms
- * and the offline one-phone game follow exactly the same rules:
+ * The game's rules, in one place (window.AyaCore in the browser; also loadable with require in Node):
  *   - text: Persian normalising, "close enough" answers, the casual story look, the bad-word filter
  *   - rounds: sentences marked true/false, votes, scoring, the reveal and the round table
  * (The old word and story question bank stays in data/bank.json but is not used for now.)

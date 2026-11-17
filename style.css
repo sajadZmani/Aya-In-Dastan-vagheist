@@ -164,9 +164,7 @@ textarea { resize: none; line-height: 1.8; font-size: 18px; }
 .summary .voters { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
 .summary .voters span { background: #fff; border-radius: 99px; padding: 2px 10px; font-size: 13px; font-weight: 700; }
 
-#netbar { position: fixed; top: calc(10px + env(safe-area-inset-top)); left: 50%; transform: translateX(-50%); z-index: 25;
-  background: var(--yellow); color: var(--ink); font-weight: 900; padding: 8px 18px; border-radius: 99px; box-shadow: 0 4px 0 rgba(0,0,0,.15); white-space: nowrap; }
-#netbar[hidden] { display: none; }
+
 
 .names { display: grid; gap: 8px; }
 .namerow { display: flex; align-items: center; gap: 8px; }

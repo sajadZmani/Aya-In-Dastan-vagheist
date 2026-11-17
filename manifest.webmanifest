@@ -3,9 +3,9 @@
   "short_name": "داستان واقعی؟",
   "lang": "fa",
   "dir": "rtl",
-  "start_url": "/",
+  "start_url": "./",
   "display": "standalone",
   "background_color": "#ec4899",
   "theme_color": "#7c3aed",
-  "icons": [{ "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }]
+  "icons": [{ "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }]
 }
